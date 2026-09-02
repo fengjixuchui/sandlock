@@ -362,12 +362,6 @@ impl BindPorts {
     }
 }
 
-/// Serde default for `control_socket` — deserialized configs that don't
-/// mention the field still get introspection enabled.
-fn default_control_socket() -> bool {
-    true
-}
-
 /// Sandbox configuration.
 #[derive(Serialize, Deserialize)]
 pub struct Sandbox {
@@ -530,12 +524,6 @@ pub struct Sandbox {
     /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
     pub no_supervisor: bool,
 
-    /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
-    /// `sandlock inspect`, etc.). Defaults to `true`. Set to `false` to skip
-    /// the runtime dir, pid file, and control-socket tokio task entirely.
-    #[serde(skip, default = "default_control_socket")]
-    pub control_socket: bool,
-
     // User-namespace identity (run-as uid/gid)
     pub user: Option<RunAs>,
 
@@ -653,7 +641,6 @@ impl Clone for Sandbox {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -1989,8 +1976,7 @@ impl Sandbox {
 
         // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
         // can discover and list them.  The control socket is only created when
-        // a supervisor exists (inside the if-let below).  Honour the
-        // control_socket opt-out knob.
+        // a supervisor exists (inside the if-let below).
         //
         // Use setup_runtime_dir_no_socket to get the liveness check — a
         // no-supervisor sandbox with the same name as a live sandbox must
@@ -2003,7 +1989,7 @@ impl Sandbox {
         // notif-fd write is the child's setup-complete signal, so returning
         // before it races killpg against setpgid and can deadlock Drop's
         // waitpid against a child parked on the ready pipe.
-        if no_supervisor && self.control_socket {
+        if no_supervisor {
             let sandbox_name = self.rt().name.clone();
             let supervisor_pid = std::process::id() as i32;
             match crate::control::setup_runtime_dir_no_socket(
@@ -2059,50 +2045,38 @@ impl Sandbox {
             // Best-effort: in nested sandboxes /dev/shm may be restricted by
             // the outer sandlock's landlock policy.  Warn and continue without
             // a control socket rather than failing the sandbox.
-            //
-            // Honour the control_socket opt-out knob: when false, skip the
-            // entire runtime dir + socket setup.
             let sandbox_name = self.rt().name.clone();
             let supervisor_pid = std::process::id() as i32;
-            let control_listener: Option<std::os::unix::net::UnixListener>;
-            if self.control_socket {
-                match crate::control::setup_runtime_dir(
-                    &sandbox_name,
-                    pid,
-                    supervisor_pid,
-                    self.mode.as_deref(),
-                ) {
-                    Ok((listener, control_dir)) => {
-                        self.rt_mut().control_dir = Some(control_dir);
-                        control_listener = Some(listener);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        // Name collision with a live sandbox — hard-fail.
-                        // A second sandbox with the same name would be
-                        // invisible to ps and its Drop would remove the
-                        // first one's runtime dir.
-                        return Err(SandboxRuntimeError::Child(format!(
-                            "sandbox '{}' is already running: {}",
-                            sandbox_name, e
-                        ))
-                        .into());
-                    }
-                    Err(e) => {
-                        // Best-effort: in nested sandboxes /dev/shm may be
-                        // restricted by the outer sandlock's landlock policy.
-                        // Warn and continue without a control socket rather
-                        // than failing the sandbox.
-                        eprintln!(
-                            "sandlock: control socket setup failed for '{}': {} \
-                             (introspection unavailable for this sandbox)",
-                            sandbox_name, e
-                        );
-                        control_listener = None;
-                    }
+            let control_listener = match crate::control::setup_runtime_dir(
+                &sandbox_name,
+                pid,
+                supervisor_pid,
+                self.mode.as_deref(),
+            ) {
+                Ok((listener, control_dir)) => {
+                    self.rt_mut().control_dir = Some(control_dir);
+                    Some(listener)
                 }
-            } else {
-                control_listener = None;
-            }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Name collision with a live sandbox — hard-fail.
+                    // A second sandbox with the same name would be
+                    // invisible to ps and its Drop would remove the
+                    // first one's runtime dir.
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "sandbox '{}' is already running: {}",
+                        sandbox_name, e
+                    ))
+                    .into());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "sandlock: control socket setup failed for '{}': {} \
+                         (introspection unavailable for this sandbox)",
+                        sandbox_name, e
+                    );
+                    None
+                }
+            };
 
             if self.time_start.is_some() || self.random_seed.is_some() {
                 let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));

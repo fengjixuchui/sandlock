@@ -413,7 +413,6 @@ and have no TOML counterpart.
 | `policy_fn` | `Callable \| None`| `None`  | Per-event dynamic policy callback. See the project README's "Dynamic Policy" section.                      |
 | `init_fn`   | `Callable \| None`| `None`  | Callback invoked once in the template process prior to COW fork.                                           |
 | `work_fn`   | `Callable \| None`| `None`  | Callback invoked in each COW clone; receives `clone_id` as its argument.                                   |
-| `control_socket` | `bool`        | `True`  | Enable the per-sandbox control socket for introspection (`sandlock ps`, `sandlock inspect`). When `False`, no runtime dir, pid file, or control-socket task is created: the sandbox is invisible to `sandlock ps` / `sandlock inspect`. `no_supervisor` sandboxes only create a control socket when `control_socket=True`. |
 
 ## Advanced
 

@@ -202,13 +202,6 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub no_supervisor: bool,
 
-    /// Enable the per-sandbox control socket for introspection. Defaults to
-    /// `true`. When `false`, no runtime dir, pid file, or control-socket task
-    /// is created — `sandlock ps` and `sandlock inspect` will not see this
-    /// sandbox.
-    #[cfg_attr(feature = "cli", clap(skip))]
-    pub control_socket: bool,
-
     #[cfg_attr(feature = "cli", arg(long = "user", value_name = "UID:GID"))]
     pub user: Option<RunAs>,
 
@@ -301,7 +294,6 @@ impl Default for SandboxBuilder {
             num_cpus: None,
             port_remap: false,
             no_supervisor: false,
-            control_socket: true,
             user: None,
             protection_policy: ProtectionPolicy::default(),
             policy_fn: None,
@@ -365,7 +357,6 @@ impl Clone for SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            control_socket: self.control_socket,
             user: self.user,
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
@@ -740,15 +731,6 @@ impl SandboxBuilder {
         self
     }
 
-    /// Enable or disable the per-sandbox control socket. Defaults to `true`.
-    /// When `false`, no runtime dir, pid file, or control-socket task is
-    /// created — `sandlock ps` and `sandlock inspect` will not see this
-    /// sandbox.
-    pub fn control_socket(mut self, v: bool) -> Self {
-        self.control_socket = v;
-        self
-    }
-
     pub fn policy_fn(
         mut self,
         f: impl Fn(crate::policy_fn::SyscallEvent, &mut crate::policy_fn::PolicyContext) -> crate::policy_fn::Verdict + Send + Sync + 'static,
@@ -1056,7 +1038,6 @@ impl SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn,
             name: self.name,

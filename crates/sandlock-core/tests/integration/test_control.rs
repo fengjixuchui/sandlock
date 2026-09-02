@@ -367,7 +367,7 @@ fn test_control_sandbox_to_json() {
 }
 
 // ============================================================
-// Name collision, --no-supervisor, control_socket=false, ports
+// Name collision, --no-supervisor, ports
 // ============================================================
 
 #[test]
@@ -497,34 +497,6 @@ fn test_control_no_supervisor() {
 
     let _ = child.kill();
     let _ = child.wait();
-}
-
-#[test]
-fn test_control_socket_disabled() {
-    // control_socket = false is a builder field, not a CLI flag.
-    // The sandbox runs without binding the control socket — the pid file
-    // is still written (via setup_runtime_dir_no_socket) so ps still sees
-    // it, but config/ports/kill via the socket fail gracefully.
-    let sb = sandlock_core::Sandbox::builder()
-        .fs_read("/usr")
-        .fs_read("/bin")
-        .control_socket(false)
-        .build()
-        .unwrap();
-    assert!(
-        !sb.control_socket,
-        "control_socket should be false"
-    );
-
-    // Also test the default (true).
-    let sb2 = sandlock_core::Sandbox::builder()
-        .fs_read("/usr")
-        .build()
-        .unwrap();
-    assert!(
-        sb2.control_socket,
-        "control_socket should default to true"
-    );
 }
 
 #[test]

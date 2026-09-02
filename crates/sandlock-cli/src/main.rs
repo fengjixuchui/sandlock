@@ -985,7 +985,7 @@ fn validate_cli_name(name: &str) -> Result<(), String> {
 
 /// Query the control socket for the virtual→real port map, returning a
 /// compact display string or `"-"` when the socket is missing (e.g.
-/// `--no-supervisor` or `control_socket = false`).
+/// `--no-supervisor`).
 fn query_ports(name: &str) -> String {
     use sandlock_core::control::send_control_request;
     match send_control_request(name, "ports", serde_json::Value::Object(Default::default())) {
