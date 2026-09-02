@@ -416,7 +416,7 @@ fn test_control_no_supervisor() {
             );
 
             let info = sandlock_core::control::sandbox_info(&name).expect("info");
-            assert!(info.child_pid > 0 && info.supervisor_pid > 0);
+            assert!(info.child_pid > 0 && info.supervisor_pid > 0, "info should report real pids: {:?}", info);
             assert_eq!(info.mode, None);
 
             let inspect = sandlock_bin().args(["inspect", &name]).output().expect("inspect");
@@ -595,14 +595,15 @@ fn test_control_stopped_supervisor_is_listed_as_unresponsive() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout.lines().find(|l| l.contains(&name));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
     assert!(
         line.is_some_and(|l| l.contains("unresponsive")),
         "a stopped supervisor should still be listed, as unresponsive: {}",
         stdout
     );
-
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[test]
