@@ -974,6 +974,9 @@ fn validate_cli_name(name: &str) -> Result<(), String> {
     if name.contains('\0') {
         return Err("sandbox name must not contain NUL bytes".into());
     }
+    if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err("sandbox name must not contain whitespace or control characters".into());
+    }
     if name.contains('/') {
         return Err("sandbox name must not contain '/'".into());
     }

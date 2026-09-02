@@ -2565,8 +2565,13 @@ fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockE
     if name.as_bytes().contains(&0) {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain NUL bytes".into()).into());
     }
-    // The name becomes a path component under /dev/shm/sandlock-$UID/.
-    // Reject names that would escape that root.
+    // The name is listed back through /proc/net/unix, which is
+    // whitespace-delimited, and it is shown in ps output.
+    if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(SandboxRuntimeError::Child(
+            "sandbox name must not contain whitespace or control characters".into(),
+        ).into());
+    }
     if name.contains('/') {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain '/'".into()).into());
     }

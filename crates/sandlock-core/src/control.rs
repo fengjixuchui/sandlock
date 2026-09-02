@@ -1,189 +1,66 @@
-//! Per-sandbox Unix control socket for introspection.
+//! Per-sandbox control socket for introspection.
 //!
-//! Every sandbox (CLI, Python SDK, embedded) gets a runtime directory under
-//! `/dev/shm/sandlock-$UID/<name>/` containing:
+//! Every sandbox (CLI, Python SDK, embedded) binds one abstract Unix
+//! stream socket named `\0sandlock/<uid>/<name>` from the supervisor
+//! process before the child is released. Abstract names live in the
+//! kernel, not the filesystem: bind on a taken name fails, so the name is
+//! the UID-wide sandbox mutex; the name vanishes with the process, so
+//! nothing is ever stale; `/proc/net/unix` lists them, so `sandlock ps`
+//! needs no registry on disk; and a nested sandlock needs no writable
+//! directory from the outer policy, only permission to create a socket.
 //!
-//! * `pid` — two-line pid file (`child_pid\nsupervisor_pid\n`); lets
-//!   `sandlock ps` list and prune dead sandboxes without opening the
-//!   socket. The child PID is used for `/proc` introspection (UPTIME,
-//!   CMD); the supervisor PID owns the control socket and is used for
-//!   liveness checks.
-//! * `control.sock` — Unix stream socket bound by the supervisor before the
-//!   child is forked.  Serves the introspection wire protocol.
+//! Abstract names carry no permission bits, so the server checks
+//! SO_PEERCRED and closes any connection from another uid.
 //!
 //! ## Wire protocol
 //!
-//! 4-byte big-endian length prefix, then UTF-8 JSON.  One client at a time per
-//! socket.
+//! 4-byte big-endian length prefix, then UTF-8 JSON.  One request per
+//! connection.
 //!
 //! Request:
 //! ```json
-//! {"v": 1, "verb": "config", "args": {}}
+//! {"v": 1, "verb": "info", "args": {}}
 //! ```
 //!
 //! Response:
 //! ```json
-//! {"v": 1, "ok": true, "data": { ...effective Sandbox policy... }}
+//! {"v": 1, "ok": true, "data": {"child_pid": 1234, "supervisor_pid": 1233, "mode": null}}
 //! ```
 //! or
 //! ```json
 //! {"v": 1, "ok": false, "err": "..."}
 //! ```
+//!
+//! Verbs: `info` (pids and mode), `config` (effective policy as
+//! `ProfileInput`), `ports` (virtual to real port map).
 
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::sandbox::Sandbox;
 use crate::seccomp::ctx::SupervisorCtx;
 
 // ============================================================
-// Public API — runtime dir helpers (used by core + CLI)
+// Socket address
 // ============================================================
 
-/// Return the per-user runtime directory root.
-pub(crate) fn runtime_dir_uid(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/dev/shm/sandlock-{}", uid))
+/// Bytes after the leading NUL of the abstract name. Public so tests can
+/// address a socket of another uid.
+pub fn socket_name(uid: u32, name: &str) -> Vec<u8> {
+    format!("sandlock/{uid}/{name}").into_bytes()
 }
 
-/// Return the per-sandbox runtime directory for a given name.
-pub fn sandbox_dir(name: &str) -> PathBuf {
+fn socket_addr(name: &str) -> std::io::Result<SocketAddr> {
     let uid = unsafe { libc::getuid() };
-    runtime_dir_uid(uid).join(name)
+    SocketAddr::from_abstract_name(socket_name(uid, name))
 }
 
-/// Return the pid file path inside a sandbox runtime dir.
-pub fn pid_path(dir: &Path) -> PathBuf {
-    dir.join("pid")
-}
-
-/// Return the control socket path inside a sandbox runtime dir.
-pub fn sock_path(dir: &Path) -> PathBuf {
-    dir.join("control.sock")
-}
-
-/// Read a sandbox's operating-mode marker (e.g. "learn") from its runtime
-/// dir. `None` for ordinary runs, which write no mode file.
-pub fn sandbox_mode(name: &str) -> Option<String> {
-    let s = std::fs::read_to_string(sandbox_dir(name).join("mode")).ok()?;
-    let s = s.trim();
-    if s.is_empty() { None } else { Some(s.to_string()) }
-}
-
-/// Read the supervisor PID from a runtime dir's pid file.
-/// Returns `None` if the file is missing, unparseable, or does not
-/// contain two lines (child_pid\nsupervisor_pid\n).
-fn read_supervisor_pid(dir: &Path) -> Option<i32> {
-    let content = std::fs::read_to_string(pid_path(dir)).ok()?;
-    // Line 2 is the supervisor PID.
-    content.lines().nth(1)?.trim().parse().ok()
-}
-
-// ============================================================
-// Runtime dir lifecycle — called from sandbox-core
-// ============================================================
-
-/// Create the per-sandbox runtime directory and write the pid file — shared
-/// by the supervisor and no_supervisor paths.  Returns the dir path.
-///
-/// # Name collision
-///
-/// If a runtime directory already exists for `name` and its supervisor is
-/// still alive, this returns `ErrorKind::AlreadyExists`.  Stale dirs (dead
-/// supervisor) are removed and recreated.
-///
-/// # no_supervisor callers
-///
-/// The `no_supervisor` path in `do_spawn` calls this directly (without the
-/// socket) instead of duplicating a bare `remove_dir_all` + `create_dir_all`
-/// that had no liveness check and would wipe a live sandbox's pid file on a
-/// name collision.
-pub(crate) fn setup_runtime_dir(
-    name: &str,
-    child_pid: i32,
-    supervisor_pid: i32,
-    mode: Option<&str>,
-) -> Result<(UnixListener, PathBuf), std::io::Error> {
-    let dir = setup_runtime_dir_no_socket(name, child_pid, supervisor_pid, mode)?;
-
-    // Bind control socket.
-    let sp = sock_path(&dir);
-    let listener = UnixListener::bind(&sp)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&sp, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    Ok((listener, dir))
-}
-
-/// Create the per-sandbox runtime directory and write the pid file, without
-/// binding a control socket.  Used by the `no_supervisor` path (no socket
-/// exists) and as the common prefix of `setup_runtime_dir` for the supervisor
-/// path.
-pub(crate) fn setup_runtime_dir_no_socket(
-    name: &str,
-    child_pid: i32,
-    supervisor_pid: i32,
-    mode: Option<&str>,
-) -> Result<PathBuf, std::io::Error> {
-    let dir = sandbox_dir(name);
-
-    // Check for name collision: if the dir exists and the sandbox is still
-    // alive, refuse to overwrite it.
-    if dir.exists() {
-        if let Some(pid) = read_supervisor_pid(&dir) {
-            if unsafe { libc::kill(pid, 0) } == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("sandbox '{}' is already running (PID {})", name, pid),
-                ));
-            }
-        }
-        // Dead or unparseable — safe to remove.
-        std::fs::remove_dir_all(&dir)?;
-    }
-    std::fs::create_dir_all(&dir)?;
-
-    // Restrict to owner.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-
-    // Write pid file atomically via temp + rename so list_live_sandboxes
-    // never sees a partially-written or empty pid file.
-    // Operating-mode marker for the `sandlock ps` STATUS column. Written
-    // before the pid file so a listing never sees the sandbox without it.
-    if let Some(m) = mode {
-        std::fs::write(dir.join("mode"), m)?;
-    }
-
-    let pid_path = pid_path(&dir);
-    let tmp_path = dir.join(".pid.tmp");
-    std::fs::write(&tmp_path, format!("{}\n{}\n", child_pid, supervisor_pid))?;
-    std::fs::rename(&tmp_path, &pid_path)?;
-
-    Ok(dir)
-}
-
-/// Remove the per-sandbox runtime directory. Best-effort: failures are logged
-/// but never propagated (called from Drop paths).
-pub fn cleanup_runtime_dir(dir: &Path) {
-    let pid_file = pid_path(dir);
-    if pid_file.exists() {
-        let _ = std::fs::remove_file(&pid_file);
-    }
-    let sp = sock_path(dir);
-    if sp.exists() {
-        let _ = std::fs::remove_file(&sp);
-    }
-    if dir.exists() {
-        let _ = std::fs::remove_dir(dir);
-    }
+/// Bind the sandbox's control socket. `AddrInUse` means a live sandbox of
+/// this uid already owns the name.
+pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<UnixListener> {
+    UnixListener::bind_addr(&socket_addr(name)?)
 }
 
 // ============================================================
@@ -470,107 +347,36 @@ async fn write_response(
 }
 
 // ============================================================
-// Pruning — called by sandlock ps to clean up stale dirs
+// Discovery
 // ============================================================
 
-/// Walk `/dev/shm/sandlock-$UID/` and return entries for every live sandbox.
-/// Dead sandboxes (supervisor process is gone) are pruned.
-///
-/// Returns `(name, child_pid)` pairs for live sandboxes.  The child PID is
-/// used by `sandlock ps` for `/proc/<pid>/stat` and `/proc/<pid>/cmdline`.
-///
-/// Directories younger than 2 seconds are never pruned, even if the pid
-/// file is missing or unparseable — this avoids a race with `setup_runtime_dir`
-/// which creates the dir before writing the pid file.
-pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
-    let uid = unsafe { libc::getuid() };
-    let root = runtime_dir_uid(uid);
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut live = Vec::new();
-    let entries = match std::fs::read_dir(&root) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    let now = std::time::SystemTime::now();
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-
-        // Parse the pid file.  Format: child_pid\nsupervisor_pid\n
-        let pid_file = pid_path(&dir);
-        let pid_str = match std::fs::read_to_string(&pid_file) {
-            Ok(s) => s,
-            Err(_) => {
-                // No pid file — could be a dir being set up concurrently.
-                // Don't prune if the dir was modified less than 2 seconds ago.
-                if !dir_is_recent(&dir, &now) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                continue;
+/// Names of every listening control socket belonging to `uid`, parsed
+/// from `/proc/net/unix` text. Columns: Num RefCount Protocol Flags Type
+/// St Inode Path; Flags 00010000 is __SO_ACCEPTCON, a listening socket.
+pub(crate) fn parse_proc_net_unix(text: &str, uid: u32) -> Vec<String> {
+    let prefix = format!("@sandlock/{uid}/");
+    let mut names: Vec<String> = text
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let flags = fields.nth(3)?;
+            let path = fields.nth(3)?;
+            if flags != "00010000" {
+                return None;
             }
-        };
-
-        let mut lines = pid_str.lines();
-        let child_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-            Some(p) => p,
-            None => {
-                if !dir_is_recent(&dir, &now) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                continue;
-            }
-        };
-        let supervisor_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-            Some(p) => p,
-            None => {
-                if !dir_is_recent(&dir, &now) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                continue;
-            }
-        };
-
-        // Liveness check: use supervisor PID since the supervisor owns
-        // the control socket.  If the supervisor is dead, the sandbox is
-        // effectively dead even if the child still runs.
-        if unsafe { libc::kill(supervisor_pid, 0) } == 0 {
-            let name = match dir.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            live.push((name, child_pid));
-        } else {
-            // Dead: prune.
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
-
-    // Sort by name for deterministic output.
-    live.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(live)
+            path.strip_prefix(&prefix).map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
-/// Return true if `dir` was modified less than 2 seconds ago.
-fn dir_is_recent(dir: &Path, now: &std::time::SystemTime) -> bool {
-    if let Ok(meta) = std::fs::metadata(dir) {
-        if let Ok(mtime) = meta.modified() {
-            if let Ok(elapsed) = now.duration_since(mtime) {
-                return elapsed.as_secs() < 2;
-            }
-        }
-    }
-    false
+/// Names of the caller's live sandboxes, sorted.
+pub fn list_sandboxes() -> std::io::Result<Vec<String>> {
+    let text = std::fs::read_to_string("/proc/net/unix")?;
+    Ok(parse_proc_net_unix(&text, unsafe { libc::getuid() }))
 }
 
 // ============================================================
@@ -645,33 +451,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_runtime_dir_paths() {
-        let dir = sandbox_dir("test-sandbox");
-        assert!(dir.to_string_lossy().contains("test-sandbox"));
-        assert!(dir.to_string_lossy().contains("sandlock-"));
+    fn longest_name_fits_sun_path() {
+        let name = "x".repeat(64);
+        // Leading NUL plus the name must fit the kernel's 108-byte sun_path.
+        assert!(socket_name(u32::MAX, &name).len() + 1 <= 108);
     }
 
     #[test]
-    fn test_runtime_dir_mode_file_roundtrip() {
+    fn parses_listening_sockets_for_uid_only() {
+        let text = "Num RefCount Protocol Flags Type St Inode Path\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 11628860 @sandlock/1000/alpha\n\
+            0000000000000000: 00000003 00000000 00000000 0001 03 11628861 @sandlock/1000/alpha\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 11628862 @sandlock/1001/other\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 11628863 /run/user/1000/bus\n\
+            0000000000000000: 00000002 00000000 00010000 0001 01 11628864 @sandlock/1000/beta\n";
+        assert_eq!(parse_proc_net_unix(text, 1000), vec!["alpha", "beta"]);
+        assert_eq!(parse_proc_net_unix(text, 1001), vec!["other"]);
+    }
+
+    #[test]
+    fn bind_is_the_name_mutex_and_listing_follows_the_listener() {
         // Unique name: sandbox names are uid-wide, never reuse a fixed one.
-        let name = format!("test-mode-{}", std::process::id());
-        let pid = std::process::id() as i32;
-
-        let dir = setup_runtime_dir_no_socket(&name, pid, pid, Some("learn")).unwrap();
-        assert_eq!(sandbox_mode(&name).as_deref(), Some("learn"));
-        cleanup_runtime_dir(&dir);
-
-        let dir = setup_runtime_dir_no_socket(&name, pid, pid, None).unwrap();
-        assert_eq!(sandbox_mode(&name), None);
-        cleanup_runtime_dir(&dir);
-    }
-
-    #[test]
-    fn test_list_live_sandboxes_empty() {
-        // When no sandboxes are running, returns empty.
-        let result = list_live_sandboxes().unwrap();
-        // May or may not be empty depending on test environment; just ensure
-        // it doesn't error.
-        assert!(result.iter().all(|(_, pid)| *pid > 0));
+        let name = format!("test-ctrl-unit-{}", std::process::id());
+        let listener = bind_control_socket(&name).unwrap();
+        assert!(list_sandboxes().unwrap().contains(&name));
+        let err = bind_control_socket(&name).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(listener);
+        assert!(!list_sandboxes().unwrap().contains(&name));
     }
 }
