@@ -2486,9 +2486,9 @@ fn sandbox_resolve_name(name: Option<&str>) -> Result<String, crate::error::Sand
 }
 
 /// A `<pid>-<counter>` suffix that makes an internally generated sandbox name
-/// unique across processes and within one. The runtime dir under
-/// /dev/shm/sandlock-$UID/ is claimed per name and a live collision is a hard
-/// error, so no internal caller may use a fixed name.
+/// unique across processes and within one. The control socket name is
+/// claimed per sandbox name and a live collision is a hard error, so no
+/// internal caller may use a fixed name.
 pub(crate) fn unique_instance_id() -> String {
     format!(
         "{}-{}",

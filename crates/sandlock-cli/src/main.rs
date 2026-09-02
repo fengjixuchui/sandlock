@@ -285,10 +285,7 @@ async fn main() -> Result<()> {
             if names.is_empty() {
                 println!("No running sandboxes.");
             } else {
-                println!(
-                    "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
-                    "NAME", "PID", "UPTIME", "STATUS", "PORTS", "CMD"
-                );
+                println!("NAME                                  PID        UPTIME  STATUS      PORTS                     CMD");
                 for name in &names {
                     match sandlock_core::control::sandbox_info(name) {
                         Ok(info) => {

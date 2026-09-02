@@ -464,7 +464,7 @@ mod tests {
     fn longest_name_fits_sun_path() {
         let name = "x".repeat(64);
         // Leading NUL plus the name must fit the kernel's 108-byte sun_path.
-        assert!(socket_name(u32::MAX, &name).len() + 1 <= 108);
+        assert!(socket_name(u32::MAX, &name).len() < 108);
     }
 
     #[test]
