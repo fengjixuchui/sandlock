@@ -275,30 +275,40 @@ async fn main() -> Result<()> {
         }
 
         Command::Ps => {
-            match sandlock_core::control::list_live_sandboxes() {
-                Ok(sandboxes) if sandboxes.is_empty() => {
-                    println!("No running sandboxes.");
-                }
-                Ok(sandboxes) => {
-                    println!(
-                        "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
-                        "NAME", "PID", "UPTIME", "STATUS", "PORTS", "CMD"
-                    );
-                    for (name, pid) in &sandboxes {
-                        let uptime = proc_uptime(*pid).unwrap_or_else(|| "?".to_string());
-                        let cmd = proc_cmdline(*pid).unwrap_or_else(|| "?".to_string());
-                        let ports = query_ports(name);
-                        let status = sandlock_core::control::sandbox_mode(name)
-                            .unwrap_or_else(|| "running".to_string());
-                        println!(
-                            "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
-                            name, pid, uptime, status, ports, cmd
-                        );
-                    }
-                }
+            let names = match sandlock_core::control::list_sandboxes() {
+                Ok(n) => n,
                 Err(e) => {
                     eprintln!("sandlock: failed to list sandboxes: {}", e);
                     std::process::exit(1);
+                }
+            };
+            if names.is_empty() {
+                println!("No running sandboxes.");
+            } else {
+                println!(
+                    "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
+                    "NAME", "PID", "UPTIME", "STATUS", "PORTS", "CMD"
+                );
+                for name in &names {
+                    match sandlock_core::control::sandbox_info(name) {
+                        Ok(info) => {
+                            let pid = info.child_pid;
+                            let uptime = proc_uptime(pid).unwrap_or_else(|| "?".to_string());
+                            let cmd = proc_cmdline(pid).unwrap_or_else(|| "?".to_string());
+                            let ports = query_ports(name);
+                            let status = info.mode.unwrap_or_else(|| "running".to_string());
+                            println!(
+                                "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
+                                name, pid, uptime, status, ports, cmd
+                            );
+                        }
+                        // The socket exists, so the process is alive; it
+                        // just is not answering.
+                        Err(_) => println!(
+                            "{:<32}        ?             ?  unresponsive  ?                         ?",
+                            name
+                        ),
+                    }
                 }
             }
         }
@@ -345,56 +355,20 @@ async fn main() -> Result<()> {
                 eprintln!("sandlock: {e}");
                 std::process::exit(1);
             }
-            // Read both PIDs from the per-sandbox pid file (no socket
-            // round-trip).  Format: child_pid\nsupervisor_pid\n
-            let dir = sandlock_core::control::sandbox_dir(&name);
-            let pid_file = sandlock_core::control::pid_path(&dir);
-            let pid_str = match std::fs::read_to_string(&pid_file) {
-                Ok(s) => s,
-                Err(_) => {
-                    eprintln!("sandlock: no sandbox named '{}'", name);
+            let info = match sandlock_core::control::sandbox_info(&name) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("sandlock: {}", e);
                     std::process::exit(1);
                 }
             };
-            let mut lines = pid_str.lines();
-            let child_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-                Some(p) => p,
-                None => {
-                    eprintln!("sandlock: invalid pid file for '{}'", name);
-                    std::process::exit(1);
-                }
-            };
-            let supervisor_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-                Some(p) => p,
-                None => {
-                    eprintln!("sandlock: invalid pid file for '{}'", name);
-                    std::process::exit(1);
-                }
-            };
-
-            // Check supervisor liveness (the process that owns the socket).
-            if unsafe { libc::kill(supervisor_pid, 0) } != 0 {
-                eprintln!(
-                    "sandlock: sandbox '{}' (supervisor PID {}) is not running",
-                    name, supervisor_pid
-                );
-                std::process::exit(1);
-            }
-
-            // killpg on child_pid kills the entire process group (child +
-            // descendants).  Also signal the supervisor directly in case
-            // it's in a different process group.
-            unsafe { libc::killpg(child_pid, libc::SIGKILL) };
-            unsafe { libc::kill(supervisor_pid, libc::SIGKILL) };
-
-            // SIGKILL bypasses Drop, so the supervisor never runs its own
-            // cleanup.  Remove the runtime dir here so it doesn't linger
-            // until the next `sandlock ps` prunes it.
-            sandlock_core::control::cleanup_runtime_dir(&dir);
-
+            // killpg takes the child's whole process group; the supervisor
+            // may sit in a different group, so signal it directly too.
+            unsafe { libc::killpg(info.child_pid, libc::SIGKILL) };
+            unsafe { libc::kill(info.supervisor_pid, libc::SIGKILL) };
             println!(
                 "Killed sandbox '{}' (child PID {}, supervisor PID {})",
-                name, child_pid, supervisor_pid
+                name, info.child_pid, info.supervisor_pid
             );
         }
 

@@ -383,6 +383,15 @@ pub fn list_sandboxes() -> std::io::Result<Vec<String>> {
 // Client helpers — used by sandlock-cli to talk to the socket
 // ============================================================
 
+fn unresponsive(name: &str, e: std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            format!("sandbox '{}' is unresponsive", name)
+        }
+        _ => format!("read from sandbox '{}': {}", name, e),
+    }
+}
+
 /// Send a request to a sandbox's control socket and return the JSON response
 /// body (the `data` field, or error).
 pub fn send_control_request(
@@ -425,16 +434,26 @@ pub fn send_control_request(
 
     // Read response.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| format!("read len: {}", e))?;
+    stream.read_exact(&mut len_buf).map_err(|e| unresponsive(name, e))?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
     if resp_len > 65536 {
         return Err("response too large".to_string());
     }
     let mut resp_body = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_body).map_err(|e| format!("read body: {}", e))?;
+    stream.read_exact(&mut resp_body).map_err(|e| unresponsive(name, e))?;
 
     serde_json::from_slice(&resp_body)
         .map_err(|e| format!("parse response: {}", e))
+}
+
+/// Ask a sandbox for its pids and mode.
+pub fn sandbox_info(name: &str) -> Result<SandboxInfo, String> {
+    let resp = send_control_request(name, "info", serde_json::Value::Object(Default::default()))?;
+    if !resp.ok {
+        return Err(resp.err.unwrap_or_else(|| "info failed".into()));
+    }
+    let data = resp.data.ok_or_else(|| "empty info response".to_string())?;
+    serde_json::from_value(data).map_err(|e| format!("parse info response: {}", e))
 }
 
 #[cfg(test)]
