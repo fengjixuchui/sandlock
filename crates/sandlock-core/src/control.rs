@@ -36,7 +36,6 @@
 
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::{SocketAddr, UnixListener};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::sandbox::Sandbox;
@@ -64,82 +63,73 @@ pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<UnixListener> {
 }
 
 // ============================================================
-// Control loop — spawned as a dedicated tokio task
+// Control loop, spawned as a dedicated tokio task
 // ============================================================
 
-/// Spawn the control-loop task.  Returns immediately after spawning; the task
-/// runs until the listener is closed or the supervisor shuts down.
-///
-/// Takes ownership of `sandbox` (moved into the task) so the config snapshot
-/// lives for the lifetime of the control loop.  The sandbox clone has
-/// `init_fn = None` (FnOnce can't be cloned), so the value is `Send`.
+/// What the `info` verb reports: everything `sandlock ps` and `kill` need.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct SandboxInfo {
+    pub child_pid: i32,
+    pub supervisor_pid: i32,
+    pub mode: Option<String>,
+}
+
+/// Spawn the control-loop task. `ctx` is `None` for sandboxes without a
+/// seccomp-notify supervisor (`--no-supervisor`, nested); those still
+/// answer `info` and the static `config`, and report no ports.
 pub(crate) fn spawn_control_loop(
     listener: UnixListener,
-    ctx: Arc<SupervisorCtx>,
+    ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Sandbox,
-    dir: PathBuf,
+    info: SandboxInfo,
 ) -> tokio::task::JoinHandle<()> {
-    // Use a Mutex to satisfy Sync (Sandbox is not Sync due to the type-level
-    // presence of Box<dyn FnOnce>, even though our clone has init_fn=None).
-    // The control loop only reads, so a Mutex is fine.
+    // Mutex only to satisfy Sync: Sandbox carries a Box<dyn FnOnce> slot
+    // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
     tokio::spawn(async move {
-        control_loop(listener, ctx, sandbox, dir).await;
+        control_loop(listener, ctx, sandbox, info).await;
     })
 }
 
-/// Accept connections on the control socket and serve one request per
-/// connection (single-client-at-a-time, no concurrency).
+fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(cred.uid)
+}
+
 async fn control_loop(
     listener: UnixListener,
-    ctx: Arc<SupervisorCtx>,
+    ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
-    _dir: PathBuf,
+    info: SandboxInfo,
 ) {
-    // Convert std listener to tokio.
     listener.set_nonblocking(true).ok();
     let listener = match tokio::net::UnixListener::from_std(listener) {
         Ok(l) => l,
         Err(_) => return,
     };
+    let my_uid = unsafe { libc::getuid() };
 
     loop {
         let (stream, _addr) = match listener.accept().await {
             Ok(pair) => pair,
             Err(_) => return,
         };
-
-        // Optional: audit peer credentials (same-UID trust boundary).
-        // SO_PEERCRED is cheap and surfaces unexpected mismatches.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let raw = stream.as_raw_fd();
-            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-            if unsafe {
-                libc::getsockopt(
-                    raw,
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    &mut cred as *mut _ as *mut libc::c_void,
-                    &mut len,
-                )
-            } == 0
-            {
-                let my_uid = unsafe { libc::getuid() };
-                if cred.uid != my_uid {
-                    eprintln!(
-                        "sandlock: control socket: peer uid {} != my uid {} — \
-                         unexpected; dir 0700 should prevent this",
-                        cred.uid, my_uid
-                    );
-                }
-            }
+        // Abstract names have no permission bits, so this is the only gate.
+        if peer_uid(&stream) != Some(my_uid) {
+            continue;
         }
-
-        // Serve one request; close after.
-        serve_one(stream, &ctx, &sandbox).await;
+        serve_one(stream, ctx.as_ref(), &sandbox, &info).await;
     }
 }
 
@@ -168,8 +158,9 @@ pub struct ControlResponse {
 
 async fn serve_one(
     stream: tokio::net::UnixStream,
-    ctx: &Arc<SupervisorCtx>,
+    ctx: Option<&Arc<SupervisorCtx>>,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
+    info: &SandboxInfo,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -214,6 +205,7 @@ async fn serve_one(
     }
 
     match req.verb.as_str() {
+        "info" => handle_info(&mut stream, info).await,
         "config" => handle_config(&mut stream, ctx, sandbox).await,
         "ports" => handle_ports(&mut stream, ctx).await,
         _ => {
@@ -228,15 +220,27 @@ async fn serve_one(
     }
 }
 
+async fn handle_info(stream: &mut tokio::net::UnixStream, info: &SandboxInfo) {
+    let resp = match serde_json::to_value(info) {
+        Ok(data) => ControlResponse { v: 1, ok: true, data: Some(data), err: None },
+        Err(e) => ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some(format!("serialize error: {}", e)),
+        },
+    };
+    let _ = write_response(stream, &resp).await;
+}
+
 async fn handle_config(
     stream: &mut tokio::net::UnixStream,
-    ctx: &Arc<SupervisorCtx>,
+    ctx: Option<&Arc<SupervisorCtx>>,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
 ) {
-    // Collect dynamic policy_fn denies.
-    let dynamic_denied: Vec<String> = {
-        let pfn = ctx.policy_fn.lock().await;
-        pfn.denied.denied_paths()
+    let dynamic_denied: Vec<String> = match ctx {
+        Some(ctx) => ctx.policy_fn.lock().await.denied.denied_paths(),
+        None => Vec::new(),
     };
 
     // Build the effective profile.
@@ -270,15 +274,11 @@ async fn handle_config(
 
 async fn handle_ports(
     stream: &mut tokio::net::UnixStream,
-    ctx: &Arc<SupervisorCtx>,
+    ctx: Option<&Arc<SupervisorCtx>>,
 ) {
-    // Read the current virtual→real port map from the supervisor's
-    // NetworkState.  This is the live mapping at request-time — more
-    // accurate than a static registry that only refreshes on bind and
-    // goes stale on SIGKILL.
-    let ports: std::collections::HashMap<u16, u16> = {
-        let ns = ctx.network.lock().await;
-        ns.port_map.virtual_to_real.clone()
+    let ports: std::collections::HashMap<u16, u16> = match ctx {
+        Some(ctx) => ctx.network.lock().await.port_map.virtual_to_real.clone(),
+        None => Default::default(),
     };
 
     let data = match serde_json::to_value(&ports) {
@@ -393,23 +393,14 @@ pub fn send_control_request(
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    let dir = sandbox_dir(name);
-
-    // Check supervisor liveness before attempting connect.  If the
-    // supervisor is dead the socket is stale and connect() would fail
-    // with a confusing "No such file" — give a clearer message.
-    if let Some(pid) = read_supervisor_pid(&dir) {
-        if unsafe { libc::kill(pid, 0) } != 0 {
-            return Err(format!(
-                "sandbox '{}' supervisor (PID {}) is not running",
-                name, pid
-            ));
+    let addr = socket_addr(name).map_err(|e| format!("socket address for '{}': {}", name, e))?;
+    let mut stream = match UnixStream::connect_addr(&addr) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Err(format!("no sandbox named '{}'", name));
         }
-    }
-
-    let sp = sock_path(&dir);
-    let mut stream = UnixStream::connect(&sp)
-        .map_err(|e| format!("connect to {:?}: {}", sp, e))?;
+        Err(e) => return Err(format!("connect to sandbox '{}': {}", name, e)),
+    };
 
     // Set a 2-second timeout on reads so a wedged supervisor does not
     // block the CLI forever.

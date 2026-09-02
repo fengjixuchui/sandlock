@@ -274,7 +274,6 @@ struct Runtime {
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
     control_handle: Option<JoinHandle<()>>,
-    control_dir: Option<PathBuf>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
     // Drains of the capture pipes above, each holding either the task still
@@ -923,11 +922,6 @@ impl Sandbox {
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
         if let Some(h) = rt.control_handle.take() { h.abort(); }
 
-        // Clean up the per-sandbox runtime dir on normal exit.
-        if let Some(ref dir) = rt.control_dir {
-            crate::control::cleanup_runtime_dir(dir);
-        }
-
         // A transactional-pipeline stage leaves the branch in the shared COW
         // state for the next stage / the coordinator's single commit — don't
         // take it out (that would strip the upper from later stages) and don't
@@ -1526,7 +1520,6 @@ impl Sandbox {
                 shared_cow: None,
                 tty_foreground_taken: false,
                 control_handle: None,
-                control_dir: None,
             }));
             clones.push(clone_sb);
         }
@@ -1608,7 +1601,6 @@ impl Sandbox {
             throttle_handle: None,
             loadavg_handle: None,
             control_handle: None,
-            control_dir: None,
             _stdout_read: None,
             _stderr_read: None,
             stdout_drain: None,
@@ -1974,51 +1966,40 @@ impl Sandbox {
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
-        // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
-        // can discover and list them.  The control socket is only created when
-        // a supervisor exists (inside the if-let below).
-        //
-        // Use setup_runtime_dir_no_socket to get the liveness check — a
-        // no-supervisor sandbox with the same name as a live sandbox must
-        // refuse to start rather than unconditionally remove_dir_all the
-        // live one's pid file.
-        //
         // This must stay after the notif-fd read above.  Any error return
         // from do_spawn relies on Drop's killpg to reap the child, which
         // only works once the child has setpgid'd into its own group; the
         // notif-fd write is the child's setup-complete signal, so returning
         // before it races killpg against setpgid and can deadlock Drop's
         // waitpid against a child parked on the ready pipe.
-        if no_supervisor {
-            let sandbox_name = self.rt().name.clone();
-            let supervisor_pid = std::process::id() as i32;
-            match crate::control::setup_runtime_dir_no_socket(
-                &sandbox_name,
-                pid,
-                supervisor_pid,
-                self.mode.as_deref(),
-            ) {
-                Ok(dir) => {
-                    self.rt_mut().control_dir = Some(dir);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Name collision with a live sandbox — hard-fail, same as
-                    // the supervisor path.  Continuing would leave a second
-                    // sandbox running invisible to ps.
-                    return Err(SandboxRuntimeError::Child(format!(
-                        "sandbox '{}' is already running: {}",
-                        sandbox_name, e
-                    ))
-                    .into());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "sandlock: runtime dir setup failed for '{}': {}",
-                        sandbox_name, e
-                    );
-                }
+        let sandbox_name = self.rt().name.clone();
+        let control_info = crate::control::SandboxInfo {
+            child_pid: pid,
+            supervisor_pid: std::process::id() as i32,
+            mode: self.mode.clone(),
+        };
+        // std creates the listener with SOCK_CLOEXEC, and the child has
+        // already forked, so it never holds this fd.
+        let mut control_listener = match crate::control::bind_control_socket(&sandbox_name) {
+            Ok(l) => Some(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(SandboxRuntimeError::Child(format!(
+                    "sandbox '{}' is already running",
+                    sandbox_name
+                ))
+                .into());
             }
-        }
+            Err(e) => {
+                // A nested sandlock whose outer policy denies AF_UNIX lands
+                // here; the sandbox still runs, it is just not introspectable.
+                eprintln!(
+                    "sandlock: control socket setup failed for '{}': {} \
+                     (introspection unavailable for this sandbox)",
+                    sandbox_name, e
+                );
+                None
+            }
+        };
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -2038,46 +2019,6 @@ impl Sandbox {
         };
 
         if let Some(notif_fd) = notif_fd {
-            // Set up the per-sandbox runtime dir and control socket.  Must
-            // happen before the notif supervisor is spawned so the socket
-            // exists when the child is released.
-            //
-            // Best-effort: in nested sandboxes /dev/shm may be restricted by
-            // the outer sandlock's landlock policy.  Warn and continue without
-            // a control socket rather than failing the sandbox.
-            let sandbox_name = self.rt().name.clone();
-            let supervisor_pid = std::process::id() as i32;
-            let control_listener = match crate::control::setup_runtime_dir(
-                &sandbox_name,
-                pid,
-                supervisor_pid,
-                self.mode.as_deref(),
-            ) {
-                Ok((listener, control_dir)) => {
-                    self.rt_mut().control_dir = Some(control_dir);
-                    Some(listener)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Name collision with a live sandbox — hard-fail.
-                    // A second sandbox with the same name would be
-                    // invisible to ps and its Drop would remove the
-                    // first one's runtime dir.
-                    return Err(SandboxRuntimeError::Child(format!(
-                        "sandbox '{}' is already running: {}",
-                        sandbox_name, e
-                    ))
-                    .into());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "sandlock: control socket setup failed for '{}': {} \
-                         (introspection unavailable for this sandbox)",
-                        sandbox_name, e
-                    );
-                    None
-                }
-            };
-
             if self.time_start.is_some() || self.random_seed.is_some() {
                 let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));
                 if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
@@ -2271,11 +2212,7 @@ impl Sandbox {
             let handlers = std::mem::take(&mut self.rt_mut().handlers);
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
 
-            // Clone ctx for the control loop before moving the original into
-            // the notif supervisor.  Only set up if the control dir was
-            // successfully created above.
             let control_ctx = Arc::clone(&ctx);
-            let control_dir_opt = self.rt().control_dir.clone();
 
             self.rt_mut().notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, ctx, handlers, startup_tx),
@@ -2296,20 +2233,15 @@ impl Sandbox {
                 }
             }
 
-            // Spawn the control-socket loop as a dedicated tokio task.
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            if let (Some(listener), Some(dir_path)) =
-                (control_listener, control_dir_opt)
-            {
-                self.rt_mut().control_handle = Some(
-                    crate::control::spawn_control_loop(
-                        listener,
-                        control_ctx,
-                        sandbox_snapshot,
-                        dir_path,
-                    )
-                );
+            if let Some(listener) = control_listener.take() {
+                self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
+                    listener,
+                    Some(control_ctx),
+                    sandbox_snapshot,
+                    control_info.clone(),
+                ));
             }
 
             let la_resource = Arc::clone(&res_state);
@@ -2323,6 +2255,17 @@ impl Sandbox {
                     rs.load_avg.sample(running);
                 }
             }));
+        }
+
+        // No notify supervisor (--no-supervisor or nested): still answer ps,
+        // inspect, and kill, with the static policy and no ports.
+        if let Some(listener) = control_listener.take() {
+            self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
+                listener,
+                None,
+                self.clone(),
+                control_info,
+            ));
         }
 
         if let Some(cpu_pct) = self.max_cpu {
@@ -2481,11 +2424,6 @@ impl Drop for Sandbox {
             // runtime.
             for slot in [rt.stdout_drain.take(), rt.stderr_drain.take()] {
                 if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
-            }
-
-            // Clean up the per-sandbox runtime dir on abnormal exit / Drop.
-            if let Some(ref dir) = rt.control_dir {
-                crate::control::cleanup_runtime_dir(dir);
             }
 
             let is_error = matches!(
