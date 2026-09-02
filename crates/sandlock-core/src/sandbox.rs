@@ -920,7 +920,12 @@ impl Sandbox {
         rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        if let Some(h) = rt.control_handle.take() { h.abort(); }
+        // Awaiting the aborted task drops its listener, so the name is free
+        // for reuse the moment wait() returns.
+        if let Some(h) = rt.control_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
 
         // A transactional-pipeline stage leaves the branch in the shared COW
         // state for the next stage / the coordinator's single commit — don't

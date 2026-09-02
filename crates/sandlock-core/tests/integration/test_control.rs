@@ -652,6 +652,27 @@ fn test_control_refuses_other_uid() {
     assert_eq!(libc::WEXITSTATUS(status), 0, "another uid must get no response");
 }
 
+/// wait() must release the name before it returns: a caller that runs the
+/// same name twice in a row must not hit the collision check.
+#[tokio::test]
+async fn test_control_name_is_free_when_wait_returns() {
+    let name = format!("test-ctrl-reuse-{}", std::process::id());
+    for _ in 0..2 {
+        let result = sandlock_core::Sandbox::builder()
+            .fs_read("/usr")
+            .fs_read("/bin")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/proc")
+            .build()
+            .unwrap()
+            .with_name(&name)
+            .run(&["true"])
+            .await;
+        assert!(result.is_ok(), "second run with the same name must succeed: {:?}", result.err());
+    }
+}
+
 // ============================================================
 // CLI kill / config input validation
 // ============================================================
