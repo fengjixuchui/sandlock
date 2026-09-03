@@ -47,7 +47,7 @@ impl Stage {
     /// Run this single stage and return the result.
     pub async fn run(self, timeout: Option<Duration>) -> Result<RunResult, SandlockError> {
         let cmd_refs: Vec<&str> = self.args.iter().map(|s| s.as_str()).collect();
-        // Names claim a per-UID runtime dir and a live collision is a hard
+        // Names claim a per-UID socket name and a live collision is a hard
         // error, so every internally assigned name carries a unique id.
         let mut sb = self.sandbox.with_name(
             format!("stage-{}", crate::sandbox::unique_instance_id()));
@@ -184,7 +184,7 @@ async fn run_pipeline(stages: Vec<Stage>) -> Result<RunResult, SandlockError> {
     let (cap_stderr_r, cap_stderr_w) = make_pipe().map_err(SandboxRuntimeError::Io)?;
 
     // Spawn each stage. Stage names share one unique run id so concurrent
-    // pipelines in the same UID never collide on their runtime dirs.
+    // pipelines in the same UID never collide on their socket names.
     let run = crate::sandbox::unique_instance_id();
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n);
 
@@ -370,7 +370,7 @@ async fn run_gather(
 
     // Spawn producers: each writes stdout to its pipe. Source and consumer
     // names share one unique run id so concurrent gathers in the same UID
-    // never collide on their runtime dirs.
+    // never collide on their socket names.
     let run = crate::sandbox::unique_instance_id();
     let mut sandboxes: Vec<Sandbox> = Vec::with_capacity(n + 1);
     for (i, ns) in sources.into_iter().enumerate() {

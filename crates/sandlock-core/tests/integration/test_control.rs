@@ -1,8 +1,9 @@
 //! Integration tests for the per-sandbox control socket.
 //!
 //! Each test starts a real sandbox through the CLI binary and drives the
-//! abstract control socket the way `sandlock ps`, `inspect`, `ports`, and
-//! `kill` do: discovery through /proc/net/unix, then info/config/ports.
+//! abstract control sockets the way `sandlock ps`, `inspect`, `ports`, and
+//! `kill` do: discovery through /proc/net/unix, pids from SO_PEERCRED,
+//! then info/config/ports.
 
 use std::process::Command;
 use std::time::Duration;

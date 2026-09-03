@@ -211,7 +211,7 @@ async fn test_hostname_virtualization() {
         .unwrap();
 
     // Unique per process so concurrent test binaries never collide on the
-    // per-name runtime dir.
+    // per-name control socket.
     let name = format!("mybox-{}", std::process::id());
 
     // Verify uname() returns the virtual hostname.

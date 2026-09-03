@@ -535,8 +535,8 @@ pub struct Sandbox {
     #[serde(skip)]
     pub name: Option<String>,
 
-    /// Operating-mode marker (e.g. "learn") written to the runtime dir at
-    /// spawn time and shown as STATUS by `sandlock ps`, so an operator sees
+    /// Operating-mode marker (e.g. "learn") served by the control socket
+    /// and shown as STATUS by `sandlock ps`, so an operator sees
     /// why a sandbox exists (learn's read-everything observation run would
     /// otherwise be indistinguishable from a dangerously permissive one).
     /// Instance metadata like `name`, not policy — never serialized.
