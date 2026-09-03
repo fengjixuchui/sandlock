@@ -246,6 +246,8 @@ pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
     );
 
     let mut mask: u64 = 0;
+    // This scope is also what keeps the confined child, which shares the
+    // supervisor's uid, off the supervisor's abstract control socket.
     if ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, abi, pol)
         == ProtectionStatus::Active
     {

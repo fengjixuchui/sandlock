@@ -2422,6 +2422,8 @@ impl Drop for Sandbox {
             rt.policy_fn_worker = None;
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            // Drop cannot await; the name is released when the runtime drops
+            // the aborted task. wait() is the synchronous path.
             if let Some(h) = rt.control_handle.take() { h.abort(); }
 
             // Nobody is left to collect these; aborting closes the read ends.
