@@ -1429,7 +1429,7 @@ impl Sandbox {
         }
 
         if pid == 0 {
-            crate::control::close_inherited_control_sockets();
+            crate::control::close_inherited_control_sockets(None);
             drop(ctrl_parent);
             unsafe { libc::setpgid(0, 0) };
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
@@ -1869,6 +1869,31 @@ impl Sandbox {
         let foreground = stdio.all_inherit();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
+        // Bound before the fork so a name collision fails with no child to
+        // reap. Both fds are CLOEXEC; the child closes its copies itself.
+        let sandbox_name = self.rt().name.clone();
+        let mut control_sockets = match crate::control::bind_control_sockets(&sandbox_name) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(SandboxRuntimeError::Child(format!(
+                    "sandbox '{}' is already running",
+                    sandbox_name
+                ))
+                .into());
+            }
+            Err(e) => {
+                // A nested sandlock whose outer policy denies AF_UNIX lands
+                // here; the sandbox still runs, it is just not introspectable.
+                eprintln!(
+                    "sandlock: control socket setup failed for '{}': {} \
+                     (introspection unavailable for this sandbox)",
+                    sandbox_name, e
+                );
+                None
+            }
+        };
+        let pgrp_socket = control_sockets.as_ref().map(|s| s.pgrp.as_raw_fd());
+
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1876,7 +1901,7 @@ impl Sandbox {
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
-            crate::control::close_inherited_control_sockets();
+            crate::control::close_inherited_control_sockets(pgrp_socket);
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
                 if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }
@@ -1932,7 +1957,6 @@ impl Sandbox {
                 .map(|h| h.0 as u32)
                 .collect();
 
-            let sandbox_name = self.rt().name.clone();
             // In-process entrypoint (OCI PID-1) names the process from cmd[0];
             // otherwise execve the command.
             let entry = match self.in_child_main {
@@ -1948,6 +1972,7 @@ impl Sandbox {
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
                 parent_pid,
+                pgrp_socket,
                 foreground,
             });
         }
@@ -1973,40 +1998,7 @@ impl Sandbox {
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
-        // This must stay after the notif-fd read above.  Any error return
-        // from do_spawn relies on Drop's killpg to reap the child, which
-        // only works once the child has setpgid'd into its own group; the
-        // notif-fd write is the child's setup-complete signal, so returning
-        // before it races killpg against setpgid and can deadlock Drop's
-        // waitpid against a child parked on the ready pipe.
-        let sandbox_name = self.rt().name.clone();
-        let control_info = crate::control::SandboxInfo {
-            child_pid: pid,
-            supervisor_pid: std::process::id() as i32,
-            mode: self.mode.clone(),
-        };
-        // std creates the listener with SOCK_CLOEXEC, and the child has
-        // already forked, so it never holds this fd.
-        let mut control_listener = match crate::control::bind_control_socket(&sandbox_name) {
-            Ok(l) => Some(l),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                return Err(SandboxRuntimeError::Child(format!(
-                    "sandbox '{}' is already running",
-                    sandbox_name
-                ))
-                .into());
-            }
-            Err(e) => {
-                // A nested sandlock whose outer policy denies AF_UNIX lands
-                // here; the sandbox still runs, it is just not introspectable.
-                eprintln!(
-                    "sandlock: control socket setup failed for '{}': {} \
-                     (introspection unavailable for this sandbox)",
-                    sandbox_name, e
-                );
-                None
-            }
-        };
+        let control_info = crate::control::SandboxInfo { mode: self.mode.clone() };
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -2242,9 +2234,9 @@ impl Sandbox {
 
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            if let Some(listener) = control_listener.take() {
+            if let Some(sockets) = control_sockets.take() {
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
-                    listener,
+                    sockets,
                     Some(control_ctx),
                     sandbox_snapshot,
                     control_info.clone(),
@@ -2266,9 +2258,9 @@ impl Sandbox {
 
         // No notify supervisor (--no-supervisor or nested): still answer ps,
         // inspect, and kill, with the static policy and no ports.
-        if let Some(listener) = control_listener.take() {
+        if let Some(sockets) = control_sockets.take() {
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
-                listener,
+                sockets,
                 None,
                 self.clone(),
                 control_info,

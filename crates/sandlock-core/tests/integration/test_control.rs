@@ -414,8 +414,10 @@ fn test_control_no_supervisor() {
                 stdout
             );
 
+            let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
+            assert_eq!(pids.supervisor, child.id() as i32, "supervisor pid: {:?}", pids);
+            assert_eq!(unsafe { libc::getpgid(pids.child) }, pids.child, "child leads its group: {:?}", pids);
             let info = sandlock_core::control::sandbox_info(&name).expect("info");
-            assert!(info.child_pid > 0 && info.supervisor_pid > 0, "info should report real pids: {:?}", info);
             assert_eq!(info.mode, None);
 
             let inspect = sandlock_bin().args(["inspect", &name]).output().expect("inspect");
@@ -556,7 +558,7 @@ fn test_control_killed_supervisor_vanishes_and_name_is_reusable() {
         let _ = first.kill();
         panic!("{}; child stderr: {}", e, stderr_output);
     }
-    let child_pid = sandlock_core::control::sandbox_info(&name).expect("info").child_pid;
+    let child_pid = sandlock_core::control::sandbox_pids(&name).expect("pids").child;
 
     // SIGKILL skips Drop entirely: nothing runs any cleanup.
     first.kill().expect("kill supervisor");
@@ -603,6 +605,45 @@ fn test_control_stopped_supervisor_is_listed_as_unresponsive() {
         "a stopped supervisor should still be listed, as unresponsive: {}",
         stdout
     );
+}
+
+/// Poll until `pid` is gone, or give up after 3s.
+fn wait_for_pid_gone(pid: i32) -> bool {
+    for _ in 0..30 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// A stopped supervisor answers nothing, and kill must not need it to.
+#[test]
+fn test_control_kill_terminates_a_stopped_supervisor() {
+    let name = format!("test-ctrl-killstop-{}", std::process::id());
+    let mut child = start_sleep_sandbox(&name);
+    if let Err(e) = wait_for_sandbox(&name) {
+        let stderr_output = child_stderr(&mut child);
+        let _ = child.kill();
+        panic!("{}; child stderr: {}", e, stderr_output);
+    }
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
+    assert_eq!(pids.supervisor, child.id() as i32);
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) };
+    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    let supervisor_gone = child.wait();
+    unsafe { libc::kill(pids.child, libc::SIGCONT) };
+
+    assert!(
+        out.status.success(),
+        "kill should succeed against a stopped supervisor: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(supervisor_gone.is_ok_and(|s| !s.success()), "supervisor should be SIGKILLed");
+    assert!(wait_for_pid_gone(pids.child), "child {} should be dead", pids.child);
+    assert!(wait_for_gone(&name), "name should be free after kill");
 }
 
 /// wait() must release the name before it returns: a caller that runs the

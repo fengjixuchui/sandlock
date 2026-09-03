@@ -237,6 +237,9 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// parent death in the child without assuming PID 1 is always init
     /// (incorrect in containers where the entrypoint runs as PID 1).
     pub parent_pid: libc::pid_t,
+    /// The sandbox's pgrp socket, listened on right after setpgid() so
+    /// `sandlock kill` learns the group leader from SO_PEERCRED.
+    pub pgrp_socket: Option<RawFd>,
     /// Make the child the terminal's foreground process group before exec.
     /// Only interactive (fully inherited) stdio wants this; a captured or
     /// piped run taking the foreground demotes the embedding process to a
@@ -288,6 +291,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         sandbox_name,
         extra_syscalls,
         parent_pid,
+        pgrp_socket,
         foreground,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
@@ -304,6 +308,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // 1. New process group
     if unsafe { libc::setpgid(0, 0) } != 0 {
         fail!("setpgid");
+    }
+    if let Some(fd) = pgrp_socket {
+        crate::control::publish_pgrp(fd);
     }
 
     // 1b. Interactive runs only: if stdin is a terminal, become the
