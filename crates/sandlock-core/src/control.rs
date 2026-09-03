@@ -61,6 +61,36 @@ pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<UnixListener> {
     UnixListener::bind_addr(&socket_addr(name)?)
 }
 
+/// First thing in a forked child. An abstract name stays bound while any
+/// fd refers to it, and a child keeps its inherited fds until it execs (a
+/// COW clone never does), so a parked child would pin every sibling's name.
+pub(crate) fn close_inherited_control_sockets() {
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else { return };
+    for entry in dir.flatten() {
+        let fd = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok());
+        if let Some(fd) = fd.filter(|&fd| is_control_socket(fd)) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn is_control_socket(fd: i32) -> bool {
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
+    };
+    if rc != 0 || addr.sun_family != libc::AF_UNIX as libc::sa_family_t {
+        return false;
+    }
+    let path_len = (len as usize).saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path));
+    let path: Vec<u8> = addr.sun_path[..path_len.min(addr.sun_path.len())]
+        .iter()
+        .map(|&c| c as u8)
+        .collect();
+    path.first() == Some(&0) && path[1..].starts_with(b"sandlock/")
+}
+
 // ============================================================
 // Control loop, spawned as a dedicated tokio task
 // ============================================================

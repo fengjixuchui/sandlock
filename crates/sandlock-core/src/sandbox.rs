@@ -1429,6 +1429,7 @@ impl Sandbox {
         }
 
         if pid == 0 {
+            crate::control::close_inherited_control_sockets();
             drop(ctrl_parent);
             unsafe { libc::setpgid(0, 0) };
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
@@ -1875,6 +1876,7 @@ impl Sandbox {
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
+            crate::control::close_inherited_control_sockets();
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
                 if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }

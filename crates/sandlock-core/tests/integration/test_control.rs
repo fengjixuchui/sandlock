@@ -626,6 +626,40 @@ async fn test_control_name_is_free_when_wait_returns() {
     }
 }
 
+/// A child forked while another sandbox's listener exists inherits that fd,
+/// and an abstract name stays bound while any fd refers to it. The child
+/// must drop those copies before it parks, or a created-but-not-started
+/// sandbox pins every other name in the process.
+#[tokio::test]
+async fn test_control_parked_child_does_not_pin_other_names() {
+    let policy = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .build()
+        .unwrap();
+    let pid = std::process::id();
+
+    let mut first = policy.clone().with_name(format!("test-ctrl-pinned-{pid}"));
+    first.create(&["true"]).await.unwrap();
+    let mut parked = policy.clone().with_name(format!("test-ctrl-parker-{pid}"));
+    parked.create(&["true"]).await.unwrap();
+
+    first.start().unwrap();
+    first.wait().await.unwrap();
+
+    let again = policy
+        .clone()
+        .with_name(format!("test-ctrl-pinned-{pid}"))
+        .run(&["true"])
+        .await;
+    parked.start().unwrap();
+    let _ = parked.wait().await;
+    assert!(again.is_ok(), "a parked sibling must not pin the name: {:?}", again.err());
+}
+
 // ============================================================
 // CLI kill / config input validation
 // ============================================================
