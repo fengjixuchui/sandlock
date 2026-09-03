@@ -382,7 +382,9 @@ pub(crate) fn parse_proc_net_unix(text: &str, uid: u32) -> Vec<String> {
 
 /// Names of the caller's live sandboxes, sorted.
 pub fn list_sandboxes() -> std::io::Result<Vec<String>> {
-    let text = std::fs::read_to_string("/proc/net/unix")?;
+    // Any process can bind an abstract name that is not UTF-8; ours are
+    // ASCII, so a mangled foreign name just fails the prefix match.
+    let text = String::from_utf8_lossy(&std::fs::read("/proc/net/unix")?).into_owned();
     Ok(parse_proc_net_unix(&text, unsafe { libc::getuid() }))
 }
 
