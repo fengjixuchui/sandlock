@@ -45,9 +45,8 @@ use crate::seccomp::ctx::SupervisorCtx;
 // Socket address
 // ============================================================
 
-/// Bytes after the leading NUL of the abstract name. Public so tests can
-/// address a socket of another uid.
-pub fn socket_name(uid: u32, name: &str) -> Vec<u8> {
+/// Bytes after the leading NUL of the abstract name.
+pub(crate) fn socket_name(uid: u32, name: &str) -> Vec<u8> {
     format!("sandlock/{uid}/{name}").into_bytes()
 }
 
@@ -87,17 +86,16 @@ pub(crate) fn spawn_control_loop(
     // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
     tokio::spawn(async move {
-        control_loop(listener, ctx, sandbox, info).await;
+        control_loop(listener, ctx, sandbox, info, unsafe { libc::getuid() }).await;
     })
 }
 
-fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
-    use std::os::unix::io::AsRawFd;
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             &mut cred as *mut _ as *mut libc::c_void,
@@ -107,18 +105,23 @@ fn peer_uid(stream: &tokio::net::UnixStream) -> Option<u32> {
     (rc == 0).then_some(cred.uid)
 }
 
+/// Accept one connection at a time and serve one request per connection.
+/// `my_uid` is a parameter so a test can prove the refusal path without a
+/// second uid. The timeout keeps one stalled client from wedging
+/// introspection, which kill now depends on.
 async fn control_loop(
     listener: UnixListener,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,
+    my_uid: u32,
 ) {
+    use std::os::unix::io::AsRawFd;
     listener.set_nonblocking(true).ok();
     let listener = match tokio::net::UnixListener::from_std(listener) {
         Ok(l) => l,
         Err(_) => return,
     };
-    let my_uid = unsafe { libc::getuid() };
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -126,10 +129,14 @@ async fn control_loop(
             Err(_) => return,
         };
         // Abstract names have no permission bits, so this is the only gate.
-        if peer_uid(&stream) != Some(my_uid) {
+        if peer_uid(stream.as_raw_fd()) != Some(my_uid) {
             continue;
         }
-        serve_one(stream, ctx.as_ref(), &sandbox, &info).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_one(stream, ctx.as_ref(), &sandbox, &info),
+        )
+        .await;
     }
 }
 
@@ -392,14 +399,26 @@ fn unresponsive(name: &str, e: std::io::Error) -> String {
     }
 }
 
-/// Send a request to a sandbox's control socket and return the JSON response
-/// body (the `data` field, or error).
+/// Send a request to a sandbox's control socket and return the response.
 pub fn send_control_request(
     name: &str,
     verb: &str,
     args: serde_json::Value,
 ) -> Result<ControlResponse, String> {
+    send_control_request_as(name, verb, args, unsafe { libc::getuid() })
+}
+
+/// `my_uid` is a parameter so a test can prove the refusal without a
+/// second uid. SO_PEERCRED on a connected stream reports the listener's
+/// credentials, so a name squatted by another user is rejected here.
+fn send_control_request_as(
+    name: &str,
+    verb: &str,
+    args: serde_json::Value,
+    my_uid: u32,
+) -> Result<ControlResponse, String> {
     use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
 
     let addr = socket_addr(name).map_err(|e| format!("socket address for '{}': {}", name, e))?;
@@ -410,6 +429,9 @@ pub fn send_control_request(
         }
         Err(e) => return Err(format!("connect to sandbox '{}': {}", name, e)),
     };
+    if peer_uid(stream.as_raw_fd()) != Some(my_uid) {
+        return Err(format!("socket for '{}' is owned by another user", name));
+    }
 
     // Set a 2-second timeout on reads so a wedged supervisor does not
     // block the CLI forever.
@@ -489,5 +511,84 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(listener);
         assert!(!list_sandboxes().unwrap().contains(&name));
+    }
+
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    fn test_sandbox() -> Sandbox {
+        Sandbox::builder().fs_read("/usr").build().unwrap()
+    }
+
+    fn info() -> SandboxInfo {
+        SandboxInfo { child_pid: 4242, supervisor_pid: 4241, mode: None }
+    }
+
+    /// Bind a listener for `name`, run the control loop on it with
+    /// `expected_uid`, and return the task handle.
+    fn serve(name: &str, expected_uid: u32) -> tokio::task::JoinHandle<()> {
+        let listener = bind_control_socket(name).unwrap();
+        let sandbox = Arc::new(tokio::sync::Mutex::new(test_sandbox()));
+        tokio::spawn(control_loop(listener, None, sandbox, info(), expected_uid))
+    }
+
+    /// Connect as ourselves, send an info request, and return what the
+    /// server sent back (empty on a silent close).
+    fn raw_info_request(name: &str) -> Vec<u8> {
+        let mut s = UnixStream::connect_addr(&socket_addr(name).unwrap()).unwrap();
+        let body = br#"{"v":1,"verb":"info","args":{}}"#;
+        s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        s.write_all(body).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_answers_its_own_uid() {
+        let name = format!("test-ctrl-own-{}", std::process::id());
+        let task = serve(&name, unsafe { libc::getuid() });
+        let out = tokio::task::spawn_blocking(move || raw_info_request(&name)).await.unwrap();
+        task.abort();
+        assert!(out.len() > 4, "expected a response, got {} bytes", out.len());
+        let resp: ControlResponse = serde_json::from_slice(&out[4..]).unwrap();
+        assert!(resp.ok);
+        let got: SandboxInfo = serde_json::from_value(resp.data.unwrap()).unwrap();
+        assert_eq!((got.child_pid, got.supervisor_pid), (4242, 4241));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_closes_on_another_uid_without_answering() {
+        let name = format!("test-ctrl-foreign-{}", std::process::id());
+        let task = serve(&name, unsafe { libc::getuid() }.wrapping_add(1));
+        let out = tokio::task::spawn_blocking(move || raw_info_request(&name)).await.unwrap();
+        task.abort();
+        assert!(out.is_empty(), "another uid must get no bytes, got {:?}", out);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_refuses_a_listener_owned_by_another_uid() {
+        let name = format!("test-ctrl-squat-{}", std::process::id());
+        let task = serve(&name, unsafe { libc::getuid() });
+        let expect = unsafe { libc::getuid() }.wrapping_add(1);
+        let n = name.clone();
+        let err = tokio::task::spawn_blocking(move || {
+            send_control_request_as(&n, "info", serde_json::Value::Object(Default::default()), expect)
+                .unwrap_err()
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(err.contains("owned by another user"), "got: {err}");
+    }
+
+    #[test]
+    fn listing_survives_a_foreign_non_utf8_name() {
+        let addr = SocketAddr::from_abstract_name(b"sandlock-probe-\xff\xfe").unwrap();
+        let _foreign = UnixListener::bind_addr(&addr).unwrap();
+        let name = format!("test-ctrl-utf8-{}", std::process::id());
+        let _ours = bind_control_socket(&name).unwrap();
+        assert!(list_sandboxes().unwrap().contains(&name));
     }
 }

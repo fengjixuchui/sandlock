@@ -1,10 +1,9 @@
-//! Integration tests for the per-sandbox control socket (RFC #68).
+//! Integration tests for the per-sandbox control socket.
 //!
-//! These tests exercise the control-socket wire protocol by starting a real
-//! sandbox via the CLI binary and querying its `config` verb, verifying that
-//! the effective policy returned matches the sandbox's configured policy.
+//! Each test starts a real sandbox through the CLI binary and drives the
+//! abstract control socket the way `sandlock ps`, `inspect`, `ports`, and
+//! `kill` do: discovery through /proc/net/unix, then info/config/ports.
 
-use std::os::linux::net::SocketAddrExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -604,52 +603,6 @@ fn test_control_stopped_supervisor_is_listed_as_unresponsive() {
         "a stopped supervisor should still be listed, as unresponsive: {}",
         stdout
     );
-}
-
-#[test]
-fn test_control_refuses_other_uid() {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("skip: needs root to switch uid");
-        return;
-    }
-    let name = format!("test-ctrl-peer-{}", std::process::id());
-    let mut child = start_sleep_sandbox(&name);
-    if let Err(e) = wait_for_sandbox(&name) {
-        let stderr_output = child_stderr(&mut child);
-        let _ = child.kill();
-        panic!("{}; child stderr: {}", e, stderr_output);
-    }
-
-    // The socket belongs to uid 0; connect as nobody from a forked child and
-    // expect the server to close without answering.
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(
-        sandlock_core::control::socket_name(0, &name),
-    ).unwrap();
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        use std::io::{Read, Write};
-        unsafe { libc::setresuid(65534, 65534, 65534) };
-        let code = match std::os::unix::net::UnixStream::connect_addr(&addr) {
-            Ok(mut s) => {
-                let body = br#"{"v":1,"verb":"info","args":{}}"#;
-                let _ = s.write_all(&(body.len() as u32).to_be_bytes());
-                let _ = s.write_all(body);
-                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 4];
-                match s.read(&mut buf) {
-                    Ok(0) => 0,
-                    _ => 1,
-                }
-            }
-            Err(_) => 0,
-        };
-        unsafe { libc::_exit(code) };
-    }
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    let _ = child.kill();
-    let _ = child.wait();
-    assert_eq!(libc::WEXITSTATUS(status), 0, "another uid must get no response");
 }
 
 /// wait() must release the name before it returns: a caller that runs the
