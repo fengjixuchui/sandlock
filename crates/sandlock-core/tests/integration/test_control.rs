@@ -703,6 +703,138 @@ async fn test_control_parked_child_does_not_pin_other_names() {
 }
 
 // ============================================================
+// pgrp socket vs extra fd targets
+// ============================================================
+
+fn open_devnull() -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    assert!(fd >= 0, "open /dev/null: {}", std::io::Error::last_os_error());
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}
+
+/// Fill every hole in the fd table so later allocations are consecutive
+/// from the returned number. `keep` holds the fillers open.
+fn make_fd_table_contiguous(keep: &mut Vec<std::os::fd::OwnedFd>) -> i32 {
+    use std::os::fd::AsRawFd;
+    let top = (0..4096).rev().find(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).unwrap();
+    loop {
+        let filler = open_devnull();
+        let fd = filler.as_raw_fd();
+        keep.push(filler);
+        if fd > top {
+            return fd + 1;
+        }
+    }
+}
+
+/// The fd number in this process bound to `name`'s pgrp socket.
+fn pgrp_fd_of(name: &str) -> Option<i32> {
+    let want = format!("\0sandlock/{}/{}/pgrp", unsafe { libc::getuid() }, name);
+    (0..4096).find(|&fd| {
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let rc = unsafe { libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
+        if rc != 0 {
+            return false;
+        }
+        let path_len = (len as usize).saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path));
+        let path: Vec<u8> = addr.sun_path[..path_len].iter().map(|&c| c as u8).collect();
+        path == want.as_bytes()
+    })
+}
+
+const FD_LAYOUT_ENV: &str = "SANDLOCK_TEST_FD_LAYOUT_CHILD";
+const FD_LAYOUT_TEST: &str = "test_control::test_control_pgrp_published_before_extra_fd_dup2";
+
+/// The child dup2s extra fds onto fixed low targets, and the pgrp socket
+/// takes the lowest free fd in the supervisor, so a target can be the pgrp
+/// socket's own number. Publishing after the dup2 would listen on the
+/// caller's fd and then close it.
+#[test]
+fn test_control_pgrp_published_before_extra_fd_dup2() {
+    // Fd numbers are only predictable while no other thread allocates,
+    // so the body runs alone in a fresh process.
+    if std::env::var_os(FD_LAYOUT_ENV).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FD_LAYOUT_TEST, "--test-threads=1"])
+            .env(FD_LAYOUT_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "fd layout body failed in the child process");
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(pgrp_published_before_extra_fd_dup2());
+}
+
+async fn pgrp_published_before_extra_fd_dup2() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let policy = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .build()
+        .unwrap();
+    let pid = std::process::id();
+    let mut fillers = Vec::new();
+
+    // Learn how many fds create() allocates before the pgrp socket.
+    let probe_name = format!("test-ctrl-pgrp-probe-{pid}");
+    let (probe_out_r, probe_out_w) = std::io::pipe().unwrap();
+    let base = make_fd_table_contiguous(&mut fillers);
+    let mut probe = policy.clone().with_name(&probe_name);
+    probe
+        .create_with_gather_io(&["true"], None, Some(probe_out_w.as_raw_fd()), None, Vec::new())
+        .await
+        .unwrap();
+    let offset = pgrp_fd_of(&probe_name).expect("probe pgrp socket") - base;
+    probe.start().unwrap();
+    probe.wait().await.unwrap();
+    drop(probe);
+    drop((probe_out_r, probe_out_w));
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    // Now aim an extra fd at exactly that number.
+    let name = format!("test-ctrl-pgrp-dup2-{pid}");
+    let (data_r, mut data_w) = std::io::pipe().unwrap();
+    data_w.write_all(b"ping\n").unwrap();
+    drop(data_w);
+    let (mut out_r, out_w) = std::io::pipe().unwrap();
+    let target = make_fd_table_contiguous(&mut fillers) + offset;
+    let mut sb = policy.with_name(&name);
+    sb.create_with_gather_io(
+        &["cat", &format!("/proc/self/fd/{target}")],
+        None,
+        Some(out_w.as_raw_fd()),
+        None,
+        vec![(target, data_r.as_raw_fd())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(pgrp_fd_of(&name), Some(target), "fd layout assumption broke");
+
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("pgrp socket listens before start");
+    assert_eq!(Some(pids.child), sb.pid());
+
+    sb.start().unwrap();
+    let result = sb.wait().await.unwrap();
+    drop(out_w);
+    let mut out = String::new();
+    out_r.read_to_string(&mut out).unwrap();
+    assert_eq!(out, "ping\n", "extra fd must survive: {result:?}");
+}
+
+// ============================================================
 // CLI kill / config input validation
 // ============================================================
 

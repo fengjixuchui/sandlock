@@ -1902,6 +1902,18 @@ impl Sandbox {
         if pid == 0 {
             // ===== CHILD PROCESS =====
             crate::control::close_inherited_control_sockets(pgrp_socket);
+            // killpg() needs the group to exist before anyone can connect,
+            // and the dup2 loops below have fixed targets that can be this
+            // socket's own fd number, so both come first.
+            if unsafe { libc::setpgid(0, 0) } != 0 {
+                use std::io::Write;
+                let err = std::io::Error::last_os_error();
+                let _ = writeln!(std::io::stderr(), "sandlock child: setpgid: {err}");
+                unsafe { libc::_exit(127) };
+            }
+            if let Some(fd) = pgrp_socket {
+                crate::control::publish_pgrp(fd);
+            }
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
                 if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }
@@ -1972,7 +1984,6 @@ impl Sandbox {
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
                 parent_pid,
-                pgrp_socket,
                 foreground,
             });
         }
