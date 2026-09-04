@@ -80,6 +80,10 @@ fn main() {
             "-static",
             "-nostdlib",
             "-no-pie",
+            // Only PC-relative code can live at the link address below; a
+            // compiler that defaults to non-PIE (manylinux's gcc-toolset)
+            // emits 32-bit absolute .bss references that cannot reach it.
+            "-fPIE",
             "-O2",
             "-ffreestanding",
             "-fno-tree-loop-distribute-patterns",
