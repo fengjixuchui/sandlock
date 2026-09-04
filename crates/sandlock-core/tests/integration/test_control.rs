@@ -1,10 +1,10 @@
-//! Integration tests for the per-sandbox control socket (RFC #68).
+//! Integration tests for the per-sandbox control socket.
 //!
-//! These tests exercise the control-socket wire protocol by starting a real
-//! sandbox via the CLI binary and querying its `config` verb, verifying that
-//! the effective policy returned matches the sandbox's configured policy.
+//! Each test starts a real sandbox through the CLI binary and drives the
+//! abstract control sockets the way `sandlock ps`, `inspect`, `ports`, and
+//! `kill` do: discovery through /proc/net/unix, pids from SO_PEERCRED,
+//! then info/config/ports.
 
-use std::ffi::CString;
 use std::process::Command;
 use std::time::Duration;
 
@@ -178,73 +178,6 @@ fn test_control_unknown_verb() {
 }
 
 #[test]
-fn test_control_prunes_stale_dirs_via_cli() {
-    let name = format!("test-ctrl-prune-{}", std::process::id());
-    let mut child = start_sleep_sandbox(&name);
-
-    match wait_for_sandbox(&name) {
-        Ok(()) => {
-            let dir = sandlock_core::control::sandbox_dir(&name);
-            assert!(dir.exists(), "runtime dir should exist: {:?}", dir);
-
-            // Read the child PID from the pid file (first line only;
-            // the file now has format child_pid\nsupervisor_pid\n).
-            let pid_file = sandlock_core::control::pid_path(&dir);
-            let child_pid: i32 = std::fs::read_to_string(&pid_file)
-                .unwrap()
-                .lines()
-                .next()
-                .and_then(|l| l.trim().parse().ok())
-                .expect("first line of pid file should be child PID");
-
-            // Kill the supervisor process (SIGKILL — no Drop cleanup).
-            child.kill().expect("kill supervisor");
-            child.wait().expect("wait supervisor");
-
-            // Also kill the sandboxed child (sleep), otherwise kill(pid,0)
-            // still sees it as alive.
-            unsafe { libc::kill(child_pid, libc::SIGKILL) };
-
-            // Wait a moment for the child to die.
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // The stale dir may or may not still exist (depends on whether
-            // the supervisor's Drop ran before SIGKILL was delivered).
-            // Either way, list_live_sandboxes should not list this sandbox
-            // and the dir should be gone after pruning.
-            let sandboxes = sandlock_core::control::list_live_sandboxes().unwrap();
-            assert!(
-                !sandboxes.iter().any(|(n, _)| n == &name),
-                "sandbox should not be listed after kill (pruned): {:?}",
-                sandboxes
-            );
-
-            // The stale dir should be gone after pruning.
-            assert!(!dir.exists(), "stale dir should be pruned: {:?}", dir);
-        }
-        Err(e) => {
-            let stderr_output = child_stderr(&mut child);
-            let _ = child.kill();
-            panic!("{}; child stderr: {}", e, stderr_output);
-        }
-    }
-}
-
-#[test]
-fn test_control_runtime_dir_paths() {
-    let dir = sandlock_core::control::sandbox_dir("test-xyz");
-    let s = dir.to_string_lossy();
-    assert!(s.contains("sandlock-"), "dir should contain sandlock-: {}", s);
-    assert!(s.contains("test-xyz"), "dir should contain name: {}", s);
-
-    let pid_file = sandlock_core::control::pid_path(&dir);
-    assert_eq!(pid_file.file_name().unwrap(), "pid");
-
-    let sock = sandlock_core::control::sock_path(&dir);
-    assert_eq!(sock.file_name().unwrap(), "control.sock");
-}
-
-#[test]
 fn test_control_sandbox_to_profile() {
     let sb = sandlock_core::Sandbox::builder()
         .fs_read("/usr")
@@ -279,11 +212,6 @@ fn test_control_mode_stays_out_of_profile() {
 
     let toml_str = sandlock_core::profile::sandbox_to_toml(&sb, &[]).unwrap();
     assert!(!toml_str.contains("mode"), "mode leaked into profile: {toml_str}");
-}
-
-#[test]
-fn test_control_sandbox_mode_absent_for_plain_runs() {
-    assert_eq!(sandlock_core::control::sandbox_mode("no-such-sandbox-mode"), None);
 }
 
 #[test]
@@ -367,7 +295,7 @@ fn test_control_sandbox_to_json() {
 }
 
 // ============================================================
-// Name collision, --no-supervisor, control_socket=false, ports
+// Name collision, --no-supervisor, ports
 // ============================================================
 
 #[test]
@@ -410,9 +338,8 @@ fn test_control_name_collision() {
 
 #[test]
 fn test_control_name_collision_no_supervisor() {
-    // The no_supervisor path shares setup_runtime_dir_no_socket and must
-    // hard-fail on a live-name collision just like the supervisor path;
-    // continuing would leave a second sandbox running invisible to ps.
+    // The no_supervisor path binds the same abstract name and must fail on
+    // a live collision just like the supervisor path.
     let name = format!("test-ctrl-collision-nosup-{}", std::process::id());
     let mut first = start_sleep_sandbox(&name);
 
@@ -487,6 +414,20 @@ fn test_control_no_supervisor() {
                 "ps should have PORTS column: {}",
                 stdout
             );
+
+            let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
+            assert_eq!(pids.supervisor, child.id() as i32, "supervisor pid: {:?}", pids);
+            assert_eq!(unsafe { libc::getpgid(pids.child) }, pids.child, "child leads its group: {:?}", pids);
+            let info = sandlock_core::control::sandbox_info(&name).expect("info");
+            assert_eq!(info.mode, None);
+
+            let inspect = sandlock_bin().args(["inspect", &name]).output().expect("inspect");
+            assert!(inspect.status.success(), "inspect should answer without a supervisor");
+
+            let ports = sandlock_core::control::send_control_request(
+                &name, "ports", serde_json::Value::Object(Default::default()),
+            ).expect("ports");
+            assert_eq!(ports.data, Some(serde_json::json!({})));
         }
         Err(e) => {
             let stderr_output = child_stderr(&mut child);
@@ -497,34 +438,6 @@ fn test_control_no_supervisor() {
 
     let _ = child.kill();
     let _ = child.wait();
-}
-
-#[test]
-fn test_control_socket_disabled() {
-    // control_socket = false is a builder field, not a CLI flag.
-    // The sandbox runs without binding the control socket — the pid file
-    // is still written (via setup_runtime_dir_no_socket) so ps still sees
-    // it, but config/ports/kill via the socket fail gracefully.
-    let sb = sandlock_core::Sandbox::builder()
-        .fs_read("/usr")
-        .fs_read("/bin")
-        .control_socket(false)
-        .build()
-        .unwrap();
-    assert!(
-        !sb.control_socket,
-        "control_socket should be false"
-    );
-
-    // Also test the default (true).
-    let sb2 = sandlock_core::Sandbox::builder()
-        .fs_read("/usr")
-        .build()
-        .unwrap();
-    assert!(
-        sb2.control_socket,
-        "control_socket should default to true"
-    );
 }
 
 #[test]
@@ -601,9 +514,8 @@ fn test_control_ps_ports_column() {
 
 #[tokio::test]
 async fn test_control_invalid_names() {
-    // Names that would escape /dev/shm/sandlock-$UID must be rejected
-    // at spawn time (sandbox_resolve_name → sandbox_validate_name).
-    for bad in &["/", "..", ".", "a/b", "../etc"] {
+    // Names that could not be listed back from /proc/net/unix, or that look like paths, are rejected at spawn time.
+    for bad in &["/", "..", ".", "a/b", "../etc", "a b", "tab\tname", "nl\nname"] {
         let result = sandlock_core::Sandbox::builder()
             .fs_read("/usr")
             .fs_read("/bin")
@@ -620,16 +532,306 @@ async fn test_control_invalid_names() {
             "sandbox name {:?} should be rejected", bad
         );
     }
+}
 
-    // Test that sandbox_dir alone does join freely — the validation layer
-    // is what prevents bad names from reaching filesystem ops.
-    let dir = sandlock_core::control::sandbox_dir("..");
-    let dir_str = dir.to_string_lossy();
+// ============================================================
+// Lifecycle: the name lives and dies with the supervisor
+// ============================================================
+
+/// Poll `list_sandboxes` until `name` is absent, or give up after 3s.
+fn wait_for_gone(name: &str) -> bool {
+    for _ in 0..30 {
+        let names = sandlock_core::control::list_sandboxes().unwrap();
+        if !names.iter().any(|n| n == name) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[test]
+fn test_control_killed_supervisor_vanishes_and_name_is_reusable() {
+    let name = format!("test-ctrl-vanish-{}", std::process::id());
+    let mut first = start_sleep_sandbox(&name);
+    if let Err(e) = wait_for_sandbox(&name) {
+        let stderr_output = child_stderr(&mut first);
+        let _ = first.kill();
+        panic!("{}; child stderr: {}", e, stderr_output);
+    }
+    let child_pid = sandlock_core::control::sandbox_pids(&name).expect("pids").child;
+
+    // SIGKILL skips Drop entirely: nothing runs any cleanup.
+    first.kill().expect("kill supervisor");
+    first.wait().expect("wait supervisor");
+    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+
+    assert!(wait_for_gone(&name), "name should disappear with the supervisor");
+
+    let mut second = start_sleep_sandbox(&name);
+    match wait_for_sandbox(&name) {
+        Ok(()) => {}
+        Err(e) => {
+            let stderr_output = child_stderr(&mut second);
+            let _ = second.kill();
+            panic!("name should be reusable immediately: {}; stderr: {}", e, stderr_output);
+        }
+    }
+    let _ = second.kill();
+    let _ = second.wait();
+}
+
+#[test]
+fn test_control_stopped_supervisor_is_listed_as_unresponsive() {
+    let name = format!("test-ctrl-stopped-{}", std::process::id());
+    let mut child = start_sleep_sandbox(&name);
+    if let Err(e) = wait_for_sandbox(&name) {
+        let stderr_output = child_stderr(&mut child);
+        let _ = child.kill();
+        panic!("{}; child stderr: {}", e, stderr_output);
+    }
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) };
+    let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    unsafe { libc::kill(child.id() as i32, libc::SIGCONT) };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().find(|l| l.contains(&name));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
     assert!(
-        dir_str.ends_with(".."),
-        "sandbox_dir('..') must append the name as-is (caller must validate): {}",
-        dir_str
+        line.is_some_and(|l| l.contains("unresponsive")),
+        "a stopped supervisor should still be listed, as unresponsive: {}",
+        stdout
     );
+}
+
+/// Poll until `pid` is gone, or give up after 3s.
+fn wait_for_pid_gone(pid: i32) -> bool {
+    for _ in 0..30 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// A stopped supervisor answers nothing, and kill must not need it to.
+#[test]
+fn test_control_kill_terminates_a_stopped_supervisor() {
+    let name = format!("test-ctrl-killstop-{}", std::process::id());
+    let mut child = start_sleep_sandbox(&name);
+    if let Err(e) = wait_for_sandbox(&name) {
+        let stderr_output = child_stderr(&mut child);
+        let _ = child.kill();
+        panic!("{}; child stderr: {}", e, stderr_output);
+    }
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
+    assert_eq!(pids.supervisor, child.id() as i32);
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) };
+    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    let supervisor_gone = child.wait();
+    unsafe { libc::kill(pids.child, libc::SIGCONT) };
+
+    assert!(
+        out.status.success(),
+        "kill should succeed against a stopped supervisor: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(supervisor_gone.is_ok_and(|s| !s.success()), "supervisor should be SIGKILLed");
+    assert!(wait_for_pid_gone(pids.child), "child {} should be dead", pids.child);
+    assert!(wait_for_gone(&name), "name should be free after kill");
+}
+
+/// wait() must release the name before it returns: a caller that runs the
+/// same name twice in a row must not hit the collision check.
+#[tokio::test]
+async fn test_control_name_is_free_when_wait_returns() {
+    let name = format!("test-ctrl-reuse-{}", std::process::id());
+    for _ in 0..2 {
+        let result = sandlock_core::Sandbox::builder()
+            .fs_read("/usr")
+            .fs_read("/bin")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/proc")
+            .build()
+            .unwrap()
+            .with_name(&name)
+            .run(&["true"])
+            .await;
+        assert!(result.is_ok(), "second run with the same name must succeed: {:?}", result.err());
+    }
+}
+
+/// A child forked while another sandbox's listener exists inherits that fd,
+/// and an abstract name stays bound while any fd refers to it. The child
+/// must drop those copies before it parks, or a created-but-not-started
+/// sandbox pins every other name in the process.
+#[tokio::test]
+async fn test_control_parked_child_does_not_pin_other_names() {
+    let policy = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .build()
+        .unwrap();
+    let pid = std::process::id();
+
+    let mut first = policy.clone().with_name(format!("test-ctrl-pinned-{pid}"));
+    first.create(&["true"]).await.unwrap();
+    let mut parked = policy.clone().with_name(format!("test-ctrl-parker-{pid}"));
+    parked.create(&["true"]).await.unwrap();
+
+    first.start().unwrap();
+    first.wait().await.unwrap();
+
+    let again = policy
+        .clone()
+        .with_name(format!("test-ctrl-pinned-{pid}"))
+        .run(&["true"])
+        .await;
+    parked.start().unwrap();
+    let _ = parked.wait().await;
+    assert!(again.is_ok(), "a parked sibling must not pin the name: {:?}", again.err());
+}
+
+// ============================================================
+// pgrp socket vs extra fd targets
+// ============================================================
+
+fn open_devnull() -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    assert!(fd >= 0, "open /dev/null: {}", std::io::Error::last_os_error());
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}
+
+/// Fill every hole in the fd table so later allocations are consecutive
+/// from the returned number. `keep` holds the fillers open.
+fn make_fd_table_contiguous(keep: &mut Vec<std::os::fd::OwnedFd>) -> i32 {
+    use std::os::fd::AsRawFd;
+    let top = (0..4096).rev().find(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0).unwrap();
+    loop {
+        let filler = open_devnull();
+        let fd = filler.as_raw_fd();
+        keep.push(filler);
+        if fd > top {
+            return fd + 1;
+        }
+    }
+}
+
+/// The fd number in this process bound to `name`'s pgrp socket.
+fn pgrp_fd_of(name: &str) -> Option<i32> {
+    let want = format!("\0sandlock/{}/{}/pgrp", unsafe { libc::getuid() }, name);
+    (0..4096).find(|&fd| {
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let rc = unsafe { libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) };
+        if rc != 0 {
+            return false;
+        }
+        let path_len = (len as usize).saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path));
+        let path: Vec<u8> = addr.sun_path[..path_len].iter().map(|&c| c as u8).collect();
+        path == want.as_bytes()
+    })
+}
+
+const FD_LAYOUT_ENV: &str = "SANDLOCK_TEST_FD_LAYOUT_CHILD";
+const FD_LAYOUT_TEST: &str = "test_control::test_control_pgrp_published_before_extra_fd_dup2";
+
+/// The child dup2s extra fds onto fixed low targets, and the pgrp socket
+/// takes the lowest free fd in the supervisor, so a target can be the pgrp
+/// socket's own number. Publishing after the dup2 would listen on the
+/// caller's fd and then close it.
+#[test]
+fn test_control_pgrp_published_before_extra_fd_dup2() {
+    // Fd numbers are only predictable while no other thread allocates,
+    // so the body runs alone in a fresh process.
+    if std::env::var_os(FD_LAYOUT_ENV).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FD_LAYOUT_TEST, "--test-threads=1"])
+            .env(FD_LAYOUT_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "fd layout body failed in the child process");
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(pgrp_published_before_extra_fd_dup2());
+}
+
+async fn pgrp_published_before_extra_fd_dup2() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let policy = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .build()
+        .unwrap();
+    let pid = std::process::id();
+    let mut fillers = Vec::new();
+
+    // Learn how many fds create() allocates before the pgrp socket.
+    let probe_name = format!("test-ctrl-pgrp-probe-{pid}");
+    let (probe_out_r, probe_out_w) = std::io::pipe().unwrap();
+    let base = make_fd_table_contiguous(&mut fillers);
+    let mut probe = policy.clone().with_name(&probe_name);
+    probe
+        .create_with_gather_io(&["true"], None, Some(probe_out_w.as_raw_fd()), None, Vec::new())
+        .await
+        .unwrap();
+    let offset = pgrp_fd_of(&probe_name).expect("probe pgrp socket") - base;
+    probe.start().unwrap();
+    probe.wait().await.unwrap();
+    drop(probe);
+    drop((probe_out_r, probe_out_w));
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    // Now aim an extra fd at exactly that number.
+    let name = format!("test-ctrl-pgrp-dup2-{pid}");
+    let (data_r, mut data_w) = std::io::pipe().unwrap();
+    data_w.write_all(b"ping\n").unwrap();
+    drop(data_w);
+    let (mut out_r, out_w) = std::io::pipe().unwrap();
+    let target = make_fd_table_contiguous(&mut fillers) + offset;
+    let mut sb = policy.with_name(&name);
+    sb.create_with_gather_io(
+        &["cat", &format!("/proc/self/fd/{target}")],
+        None,
+        Some(out_w.as_raw_fd()),
+        None,
+        vec![(target, data_r.as_raw_fd())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(pgrp_fd_of(&name), Some(target), "fd layout assumption broke");
+
+    let pids = sandlock_core::control::sandbox_pids(&name).expect("pgrp socket listens before start");
+    assert_eq!(Some(pids.child), sb.pid());
+
+    sb.start().unwrap();
+    let result = sb.wait().await.unwrap();
+    drop(out_w);
+    let mut out = String::new();
+    out_r.read_to_string(&mut out).unwrap();
+    assert_eq!(out, "ping\n", "extra fd must survive: {result:?}");
 }
 
 // ============================================================
@@ -691,52 +893,5 @@ fn test_control_cli_kill_nonexistent() {
         stderr.contains("no sandbox named") || stderr.contains("not running"),
         "kill nonexistent should say 'no sandbox named', got: {}",
         stderr
-    );
-}
-
-// ============================================================
-// pid file format — two lines required (old single-line shim removed)
-// ============================================================
-
-#[test]
-fn test_control_single_line_pid_file_is_pruned() {
-    let dir = sandlock_core::control::sandbox_dir("test-single-line-pid");
-    std::fs::create_dir_all(&dir).expect("create test dir");
-
-    // Write a pid file with only one line — the format that never shipped.
-    let pid_path = sandlock_core::control::pid_path(&dir);
-    std::fs::write(&pid_path, "12345\n").expect("write single-line pid file");
-
-    // Set the dir mtime to >2s ago so the recency check allows pruning.
-    // list_live_sandboxes won't prune dirs modified less than 2s ago
-    // (concurrent setup protection).
-    let old_time = libc::timespec {
-        tv_sec: 1000, // Unix epoch + 1000s — ancient
-        tv_nsec: 0,
-    };
-    let times = [old_time, old_time];
-    let dir_cstr = CString::new(dir.to_str().unwrap()).expect("valid C string");
-    let rc = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            dir_cstr.as_ptr(),
-            times.as_ptr(),
-            0,
-        )
-    };
-    assert_eq!(rc, 0, "utimensat failed on {:?}", dir);
-
-    // list_live_sandboxes must prune this dir (supervisor_pid parse fails
-    // and the mtime is old).
-    let sandboxes = sandlock_core::control::list_live_sandboxes()
-        .expect("list_live_sandboxes");
-    assert!(
-        !sandboxes.iter().any(|(n, _)| n == "test-single-line-pid"),
-        "single-line pid dir should not be listed, got: {:?}",
-        sandboxes
-    );
-    assert!(
-        !dir.exists(),
-        "single-line pid dir should be pruned"
     );
 }

@@ -274,7 +274,6 @@ struct Runtime {
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
     control_handle: Option<JoinHandle<()>>,
-    control_dir: Option<PathBuf>,
     _stdout_read: Option<std::os::fd::OwnedFd>,
     _stderr_read: Option<std::os::fd::OwnedFd>,
     // Drains of the capture pipes above, each holding either the task still
@@ -360,12 +359,6 @@ impl BindPorts {
     pub fn is_all(&self) -> bool {
         matches!(self, BindPorts::All)
     }
-}
-
-/// Serde default for `control_socket` — deserialized configs that don't
-/// mention the field still get introspection enabled.
-fn default_control_socket() -> bool {
-    true
 }
 
 /// Sandbox configuration.
@@ -530,12 +523,6 @@ pub struct Sandbox {
     /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
     pub no_supervisor: bool,
 
-    /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
-    /// `sandlock inspect`, etc.). Defaults to `true`. Set to `false` to skip
-    /// the runtime dir, pid file, and control-socket tokio task entirely.
-    #[serde(skip, default = "default_control_socket")]
-    pub control_socket: bool,
-
     // User-namespace identity (run-as uid/gid)
     pub user: Option<RunAs>,
 
@@ -548,8 +535,8 @@ pub struct Sandbox {
     #[serde(skip)]
     pub name: Option<String>,
 
-    /// Operating-mode marker (e.g. "learn") written to the runtime dir at
-    /// spawn time and shown as STATUS by `sandlock ps`, so an operator sees
+    /// Operating-mode marker (e.g. "learn") served by the control socket
+    /// and shown as STATUS by `sandlock ps`, so an operator sees
     /// why a sandbox exists (learn's read-everything observation run would
     /// otherwise be indistinguishable from a dangerously permissive one).
     /// Instance metadata like `name`, not policy — never serialized.
@@ -653,7 +640,6 @@ impl Clone for Sandbox {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
-            control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -934,11 +920,11 @@ impl Sandbox {
         rt.policy_fn_worker = None;
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        if let Some(h) = rt.control_handle.take() { h.abort(); }
-
-        // Clean up the per-sandbox runtime dir on normal exit.
-        if let Some(ref dir) = rt.control_dir {
-            crate::control::cleanup_runtime_dir(dir);
+        // Awaiting the aborted task drops its listener, so the name is free
+        // for reuse the moment wait() returns.
+        if let Some(h) = rt.control_handle.take() {
+            h.abort();
+            let _ = h.await;
         }
 
         // A transactional-pipeline stage leaves the branch in the shared COW
@@ -1436,7 +1422,7 @@ impl Sandbox {
             }
         }
 
-        let pid = unsafe { libc::fork() };
+        let pid = crate::control::fork_without_control_fds(None);
         if pid < 0 {
             unsafe { libc::close(ctrl_child_fd) };
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1539,7 +1525,6 @@ impl Sandbox {
                 shared_cow: None,
                 tty_foreground_taken: false,
                 control_handle: None,
-                control_dir: None,
             }));
             clones.push(clone_sb);
         }
@@ -1621,7 +1606,6 @@ impl Sandbox {
             throttle_handle: None,
             loadavg_handle: None,
             control_handle: None,
-            control_dir: None,
             _stdout_read: None,
             _stderr_read: None,
             stdout_drain: None,
@@ -1884,13 +1868,50 @@ impl Sandbox {
         let foreground = stdio.all_inherit();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
-        let pid = unsafe { libc::fork() };
+        // Bound before the fork so a name collision fails with no child to
+        // reap. The child sheds its copies as it forks.
+        let sandbox_name = self.rt().name.clone();
+        let mut control_sockets = match crate::control::bind_control_sockets(&sandbox_name) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(SandboxRuntimeError::Child(format!(
+                    "sandbox '{}' is already running",
+                    sandbox_name
+                ))
+                .into());
+            }
+            Err(e) => {
+                // A nested sandlock whose outer policy denies AF_UNIX lands
+                // here; the sandbox still runs, it is just not introspectable.
+                eprintln!(
+                    "sandlock: control socket setup failed for '{}': {} \
+                     (introspection unavailable for this sandbox)",
+                    sandbox_name, e
+                );
+                None
+            }
+        };
+        let pgrp_socket = control_sockets.as_ref().map(|s| s.pgrp.as_raw_fd());
+
+        let pid = crate::control::fork_without_control_fds(pgrp_socket);
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
+            // killpg() needs the group to exist before anyone can connect,
+            // and the dup2 loops below have fixed targets that can be this
+            // socket's own fd number, so both come first.
+            if unsafe { libc::setpgid(0, 0) } != 0 {
+                use std::io::Write;
+                let err = std::io::Error::last_os_error();
+                let _ = writeln!(std::io::stderr(), "sandlock child: setpgid: {err}");
+                unsafe { libc::_exit(127) };
+            }
+            if let Some(fd) = pgrp_socket {
+                crate::control::publish_pgrp(fd);
+            }
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
                 if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }
@@ -1946,7 +1967,6 @@ impl Sandbox {
                 .map(|h| h.0 as u32)
                 .collect();
 
-            let sandbox_name = self.rt().name.clone();
             // In-process entrypoint (OCI PID-1) names the process from cmd[0];
             // otherwise execve the command.
             let entry = match self.in_child_main {
@@ -1987,52 +2007,7 @@ impl Sandbox {
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
-        // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
-        // can discover and list them.  The control socket is only created when
-        // a supervisor exists (inside the if-let below).  Honour the
-        // control_socket opt-out knob.
-        //
-        // Use setup_runtime_dir_no_socket to get the liveness check — a
-        // no-supervisor sandbox with the same name as a live sandbox must
-        // refuse to start rather than unconditionally remove_dir_all the
-        // live one's pid file.
-        //
-        // This must stay after the notif-fd read above.  Any error return
-        // from do_spawn relies on Drop's killpg to reap the child, which
-        // only works once the child has setpgid'd into its own group; the
-        // notif-fd write is the child's setup-complete signal, so returning
-        // before it races killpg against setpgid and can deadlock Drop's
-        // waitpid against a child parked on the ready pipe.
-        if no_supervisor && self.control_socket {
-            let sandbox_name = self.rt().name.clone();
-            let supervisor_pid = std::process::id() as i32;
-            match crate::control::setup_runtime_dir_no_socket(
-                &sandbox_name,
-                pid,
-                supervisor_pid,
-                self.mode.as_deref(),
-            ) {
-                Ok(dir) => {
-                    self.rt_mut().control_dir = Some(dir);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Name collision with a live sandbox — hard-fail, same as
-                    // the supervisor path.  Continuing would leave a second
-                    // sandbox running invisible to ps.
-                    return Err(SandboxRuntimeError::Child(format!(
-                        "sandbox '{}' is already running: {}",
-                        sandbox_name, e
-                    ))
-                    .into());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "sandlock: runtime dir setup failed for '{}': {}",
-                        sandbox_name, e
-                    );
-                }
-            }
-        }
+        let control_info = crate::control::SandboxInfo { mode: self.mode.clone() };
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -2052,58 +2027,6 @@ impl Sandbox {
         };
 
         if let Some(notif_fd) = notif_fd {
-            // Set up the per-sandbox runtime dir and control socket.  Must
-            // happen before the notif supervisor is spawned so the socket
-            // exists when the child is released.
-            //
-            // Best-effort: in nested sandboxes /dev/shm may be restricted by
-            // the outer sandlock's landlock policy.  Warn and continue without
-            // a control socket rather than failing the sandbox.
-            //
-            // Honour the control_socket opt-out knob: when false, skip the
-            // entire runtime dir + socket setup.
-            let sandbox_name = self.rt().name.clone();
-            let supervisor_pid = std::process::id() as i32;
-            let control_listener: Option<std::os::unix::net::UnixListener>;
-            if self.control_socket {
-                match crate::control::setup_runtime_dir(
-                    &sandbox_name,
-                    pid,
-                    supervisor_pid,
-                    self.mode.as_deref(),
-                ) {
-                    Ok((listener, control_dir)) => {
-                        self.rt_mut().control_dir = Some(control_dir);
-                        control_listener = Some(listener);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        // Name collision with a live sandbox — hard-fail.
-                        // A second sandbox with the same name would be
-                        // invisible to ps and its Drop would remove the
-                        // first one's runtime dir.
-                        return Err(SandboxRuntimeError::Child(format!(
-                            "sandbox '{}' is already running: {}",
-                            sandbox_name, e
-                        ))
-                        .into());
-                    }
-                    Err(e) => {
-                        // Best-effort: in nested sandboxes /dev/shm may be
-                        // restricted by the outer sandlock's landlock policy.
-                        // Warn and continue without a control socket rather
-                        // than failing the sandbox.
-                        eprintln!(
-                            "sandlock: control socket setup failed for '{}': {} \
-                             (introspection unavailable for this sandbox)",
-                            sandbox_name, e
-                        );
-                        control_listener = None;
-                    }
-                }
-            } else {
-                control_listener = None;
-            }
-
             if self.time_start.is_some() || self.random_seed.is_some() {
                 let time_offset = self.time_start.map(|t| crate::time::calculate_time_offset(t));
                 if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
@@ -2297,11 +2220,7 @@ impl Sandbox {
             let handlers = std::mem::take(&mut self.rt_mut().handlers);
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
 
-            // Clone ctx for the control loop before moving the original into
-            // the notif supervisor.  Only set up if the control dir was
-            // successfully created above.
             let control_ctx = Arc::clone(&ctx);
-            let control_dir_opt = self.rt().control_dir.clone();
 
             self.rt_mut().notif_handle = Some(tokio::spawn(
                 notif::supervisor(notif_fd, ctx, handlers, startup_tx),
@@ -2322,20 +2241,15 @@ impl Sandbox {
                 }
             }
 
-            // Spawn the control-socket loop as a dedicated tokio task.
             // Independent of the seccomp-notify loop so accept() never adds
             // latency to syscall notification processing.
-            if let (Some(listener), Some(dir_path)) =
-                (control_listener, control_dir_opt)
-            {
-                self.rt_mut().control_handle = Some(
-                    crate::control::spawn_control_loop(
-                        listener,
-                        control_ctx,
-                        sandbox_snapshot,
-                        dir_path,
-                    )
-                );
+            if let Some(sockets) = control_sockets.take() {
+                self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
+                    sockets,
+                    Some(control_ctx),
+                    sandbox_snapshot,
+                    control_info.clone(),
+                ));
             }
 
             let la_resource = Arc::clone(&res_state);
@@ -2349,6 +2263,17 @@ impl Sandbox {
                     rs.load_avg.sample(running);
                 }
             }));
+        }
+
+        // No notify supervisor (--no-supervisor or nested): still answer ps,
+        // inspect, and kill, with the static policy and no ports.
+        if let Some(sockets) = control_sockets.take() {
+            self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
+                sockets,
+                None,
+                self.clone(),
+                control_info,
+            ));
         }
 
         if let Some(cpu_pct) = self.max_cpu {
@@ -2500,6 +2425,8 @@ impl Drop for Sandbox {
             rt.policy_fn_worker = None;
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            // Drop cannot await; the name is released when the runtime drops
+            // the aborted task. wait() is the synchronous path.
             if let Some(h) = rt.control_handle.take() { h.abort(); }
 
             // Nobody is left to collect these; aborting closes the read ends.
@@ -2507,11 +2434,6 @@ impl Drop for Sandbox {
             // runtime.
             for slot in [rt.stdout_drain.take(), rt.stderr_drain.take()] {
                 if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
-            }
-
-            // Clean up the per-sandbox runtime dir on abnormal exit / Drop.
-            if let Some(ref dir) = rt.control_dir {
-                crate::control::cleanup_runtime_dir(dir);
             }
 
             let is_error = matches!(
@@ -2569,9 +2491,9 @@ fn sandbox_resolve_name(name: Option<&str>) -> Result<String, crate::error::Sand
 }
 
 /// A `<pid>-<counter>` suffix that makes an internally generated sandbox name
-/// unique across processes and within one. The runtime dir under
-/// /dev/shm/sandlock-$UID/ is claimed per name and a live collision is a hard
-/// error, so no internal caller may use a fixed name.
+/// unique across processes and within one. The control socket name is
+/// claimed per sandbox name and a live collision is a hard error, so no
+/// internal caller may use a fixed name.
 pub(crate) fn unique_instance_id() -> String {
     format!(
         "{}-{}",
@@ -2591,8 +2513,13 @@ fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockE
     if name.as_bytes().contains(&0) {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain NUL bytes".into()).into());
     }
-    // The name becomes a path component under /dev/shm/sandlock-$UID/.
-    // Reject names that would escape that root.
+    // The name is listed back through /proc/net/unix, which is
+    // whitespace-delimited, and it is shown in ps output.
+    if name.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(SandboxRuntimeError::Child(
+            "sandbox name must not contain whitespace or control characters".into(),
+        ).into());
+    }
     if name.contains('/') {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain '/'".into()).into());
     }

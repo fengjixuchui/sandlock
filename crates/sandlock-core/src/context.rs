@@ -301,12 +301,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     use std::io::Write;
 
-    // 1. New process group
-    if unsafe { libc::setpgid(0, 0) } != 0 {
-        fail!("setpgid");
-    }
-
-    // 1b. Interactive runs only: if stdin is a terminal, become the
+    // 1. Interactive runs only: if stdin is a terminal, become the
     //     foreground process group so interactive shells can read from the
     //     TTY. Captured/piped runs must not: the embedding process keeps
     //     the terminal (issue #164).

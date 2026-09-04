@@ -693,7 +693,7 @@ async fn drive_txn_stages(
     let tee_fd: Option<OwnedFd> = if tee_stderr { open_stderr_tee() } else { None };
 
     // Stage names share one unique run id so concurrent transactions in the
-    // same UID never collide on their runtime dirs.
+    // same UID never collide on their socket names.
     let run = crate::sandbox::unique_instance_id();
     for (i, stage) in stages.into_iter().enumerate() {
         let at = |source: SandlockError| TxnError::Stage { index: i, source };

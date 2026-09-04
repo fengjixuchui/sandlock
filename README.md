@@ -771,9 +771,9 @@ stop them:
 
 ```
 $ sandlock ps
-NAME                                  PID        UPTIME  CMD
-api.local                           12345            5m  python3 server.py
-web.local                           12346            3m  python3 server.py
+NAME                                  PID        UPTIME  STATUS      PORTS                     CMD
+api.local                           12345            5m  running     8080→41235                python3 server.py
+web.local                           12346            3m  running     8080→41236                python3 server.py
 
 $ sandlock inspect api.local --toml | head -10
 [config]
@@ -783,7 +783,7 @@ http_inject_ca = []
 ...
 
 $ sandlock kill web.local
-Killed sandbox 'web.local' (PID 12346)
+Killed sandbox 'web.local' (child PID 12346, supervisor PID 12340)
 ```
 
 This enables external reverse proxies (nginx, envoy) to route traffic
