@@ -44,9 +44,13 @@
 //! `ProfileInput`), `ports` (virtual to real port map).
 
 use std::os::linux::net::SocketAddrExt;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
+
+use tokio::io::unix::AsyncFd;
 
 use crate::sandbox::Sandbox;
 use crate::seccomp::ctx::SupervisorCtx;
@@ -75,19 +79,113 @@ fn pgrp_socket_addr(name: &str) -> std::io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(pgrp_socket_name(uid, name))
 }
 
+// ============================================================
+// Live control fds
+// ============================================================
+
+/// Every control fd this process holds, so a forked child can close them
+/// without reading /proc. Bind, close, and fork() all take the lock, so a
+/// child never sees an fd that is half registered.
+static LIVE: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
+
+fn live() -> std::sync::MutexGuard<'static, Vec<RawFd>> {
+    LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A socket fd that stays on the live list until it closes.
+#[derive(Debug)]
+pub(crate) struct ControlFd(RawFd);
+
+impl ControlFd {
+    fn register(fd: OwnedFd) -> Self {
+        let fd = fd.into_raw_fd();
+        live().push(fd);
+        ControlFd(fd)
+    }
+
+    fn set_nonblocking(&self) -> std::io::Result<()> {
+        let flags = unsafe { libc::fcntl(self.0, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(self.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn accept(&self) -> std::io::Result<ControlFd> {
+        let fd = unsafe {
+            libc::accept4(
+                self.0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ControlFd::register(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::write(self.0, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+}
+
+impl AsRawFd for ControlFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for ControlFd {
+    fn drop(&mut self) {
+        let mut live = live();
+        live.retain(|&fd| fd != self.0);
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// fork() with the live list locked. The child closes every control fd but
+/// `keep` before anything else runs, so the sandbox never holds one; `keep`
+/// is the child's own pgrp socket, which it still has to listen on.
+pub(crate) fn fork_without_control_fds(keep: Option<RawFd>) -> libc::pid_t {
+    let live = live();
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        for &fd in live.iter() {
+            if Some(fd) != keep {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+    pid
+}
+
 /// Both sockets of one sandbox, bound before it forks. `control` already
 /// listens, from the supervisor. `pgrp` is bound only: the child calls
 /// listen() on it after setpgid(), so its peer pid is the group leader.
 #[derive(Debug)]
 pub(crate) struct ControlSockets {
-    pub control: UnixListener,
-    pub pgrp: OwnedFd,
+    pub control: ControlFd,
+    pub pgrp: ControlFd,
 }
 
 /// `AddrInUse` means a live sandbox of this uid already owns the name.
 pub(crate) fn bind_control_sockets(name: &str) -> std::io::Result<ControlSockets> {
-    let control = UnixListener::bind_addr(&socket_addr(name)?)?;
-    let pgrp = bind_only(&pgrp_socket_addr(name)?)?;
+    let control = ControlFd::register(UnixListener::bind_addr(&socket_addr(name)?)?.into());
+    let pgrp = ControlFd::register(bind_only(&pgrp_socket_addr(name)?)?);
     Ok(ControlSockets { control, pgrp })
 }
 
@@ -123,37 +221,6 @@ pub(crate) fn publish_pgrp(fd: RawFd) {
     }
 }
 
-/// First thing in a forked child. An abstract name stays bound while any
-/// fd refers to it, and a child keeps its inherited fds until it execs (a
-/// COW clone never does), so a parked child would pin every sibling's name.
-/// `keep` is the child's own pgrp socket, which it still has to listen on.
-pub(crate) fn close_inherited_control_sockets(keep: Option<RawFd>) {
-    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else { return };
-    for entry in dir.flatten() {
-        let fd = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok());
-        if let Some(fd) = fd.filter(|&fd| Some(fd) != keep && is_control_socket(fd)) {
-            unsafe { libc::close(fd) };
-        }
-    }
-}
-
-fn is_control_socket(fd: i32) -> bool {
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len)
-    };
-    if rc != 0 || addr.sun_family != libc::AF_UNIX as libc::sa_family_t {
-        return false;
-    }
-    let path_len = (len as usize).saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path));
-    let path: Vec<u8> = addr.sun_path[..path_len.min(addr.sun_path.len())]
-        .iter()
-        .map(|&c| c as u8)
-        .collect();
-    path.first() == Some(&0) && path[1..].starts_with(b"sandlock/")
-}
-
 // ============================================================
 // Control loop, spawned as a dedicated tokio task
 // ============================================================
@@ -176,9 +243,9 @@ pub(crate) fn spawn_control_loop(
     // Mutex only to satisfy Sync: Sandbox carries a Box<dyn FnOnce> slot
     // even though this clone's is None.
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
-    let pgrp = UnixListener::from(sockets.pgrp);
     tokio::spawn(async move {
-        control_loop(sockets.control, Some(pgrp), ctx, sandbox, info, unsafe { libc::getuid() }).await;
+        let ControlSockets { control, pgrp } = sockets;
+        control_loop(control, Some(pgrp), ctx, sandbox, info, unsafe { libc::getuid() }).await;
     })
 }
 
@@ -197,9 +264,64 @@ fn peer_cred(fd: RawFd) -> Option<libc::ucred> {
     (rc == 0).then_some(cred)
 }
 
-fn into_tokio(listener: UnixListener) -> Option<tokio::net::UnixListener> {
-    listener.set_nonblocking(true).ok()?;
-    tokio::net::UnixListener::from_std(listener).ok()
+fn into_async(fd: ControlFd) -> Option<AsyncFd<ControlFd>> {
+    fd.set_nonblocking().ok()?;
+    AsyncFd::new(fd).ok()
+}
+
+async fn accept(listener: &AsyncFd<ControlFd>) -> std::io::Result<ControlFd> {
+    loop {
+        let mut guard = listener.readable().await?;
+        match guard.try_io(|inner| inner.get_ref().accept()) {
+            Ok(result) => return result,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+/// One accepted connection, driven through the reactor while its fd stays
+/// on the live list.
+struct ControlStream(AsyncFd<ControlFd>);
+
+impl tokio::io::AsyncRead for ControlStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = std::task::ready!(self.0.poll_read_ready(cx))?;
+            let unfilled = buf.initialize_unfilled();
+            match guard.try_io(|inner| inner.get_ref().read(unfilled)) {
+                Ok(Ok(n)) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(e)) => return Poll::Ready(Err(e)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ControlStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = std::task::ready!(self.0.poll_write_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().write(buf)) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Accept one connection at a time and serve one request per connection.
@@ -210,26 +332,26 @@ fn into_tokio(listener: UnixListener) -> Option<tokio::net::UnixListener> {
 /// dropped to keep its backlog empty; a child that never called listen()
 /// makes accept() fail with EINVAL, after which the socket is left alone.
 async fn control_loop(
-    listener: UnixListener,
-    pgrp: Option<UnixListener>,
+    listener: ControlFd,
+    pgrp: Option<ControlFd>,
     ctx: Option<Arc<SupervisorCtx>>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,
     my_uid: u32,
 ) {
-    let Some(listener) = into_tokio(listener) else { return };
-    let mut pgrp = pgrp.and_then(into_tokio);
+    let Some(listener) = into_async(listener) else { return };
+    let mut pgrp = pgrp.and_then(into_async);
 
     loop {
         let drain = async {
             match &pgrp {
-                Some(l) => l.accept().await,
+                Some(l) => accept(l).await,
                 None => std::future::pending().await,
             }
         };
         let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+            accepted = accept(&listener) => match accepted {
+                Ok(stream) => stream,
                 Err(_) => return,
             },
             drained = drain => {
@@ -243,6 +365,7 @@ async fn control_loop(
         if peer_cred(stream.as_raw_fd()).map(|c| c.uid) != Some(my_uid) {
             continue;
         }
+        let Ok(stream) = AsyncFd::new(stream).map(ControlStream) else { continue };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             serve_one(stream, ctx.as_ref(), &sandbox, &info),
@@ -275,7 +398,7 @@ pub struct ControlResponse {
 }
 
 async fn serve_one(
-    stream: tokio::net::UnixStream,
+    stream: ControlStream,
     ctx: Option<&Arc<SupervisorCtx>>,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
     info: &SandboxInfo,
@@ -338,7 +461,7 @@ async fn serve_one(
     }
 }
 
-async fn handle_info(stream: &mut tokio::net::UnixStream, info: &SandboxInfo) {
+async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo) {
     let resp = match serde_json::to_value(info) {
         Ok(data) => ControlResponse { v: 1, ok: true, data: Some(data), err: None },
         Err(e) => ControlResponse {
@@ -352,7 +475,7 @@ async fn handle_info(stream: &mut tokio::net::UnixStream, info: &SandboxInfo) {
 }
 
 async fn handle_config(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut ControlStream,
     ctx: Option<&Arc<SupervisorCtx>>,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
 ) {
@@ -391,7 +514,7 @@ async fn handle_config(
 }
 
 async fn handle_ports(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut ControlStream,
     ctx: Option<&Arc<SupervisorCtx>>,
 ) {
     let ports: std::collections::HashMap<u16, u16> = match ctx {
@@ -425,7 +548,7 @@ async fn handle_ports(
 /// Write a length-prefixed JSON response.  Rejects bodies over 64 KB
 /// (mirrors the client-side cap in `send_control_request`).
 async fn write_response(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut ControlStream,
     resp: &ControlResponse,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -668,6 +791,40 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         drop(sockets);
         assert!(!list_sandboxes().unwrap().contains(&name));
+    }
+
+    /// The live list is exactly what a forked child closes, so it has to
+    /// follow every bind and every drop.
+    #[test]
+    fn live_list_follows_bind_and_drop() {
+        let name = format!("test-ctrl-live-{}", std::process::id());
+        let sockets = bind_control_sockets(&name).unwrap();
+        let (control, pgrp) = (sockets.control.as_raw_fd(), sockets.pgrp.as_raw_fd());
+        assert!(live().contains(&control) && live().contains(&pgrp));
+        drop(sockets);
+        assert!(!live().contains(&control) && !live().contains(&pgrp));
+    }
+
+    /// A forked child keeps only the pgrp socket it was told to, with no
+    /// help from /proc.
+    #[test]
+    fn forked_child_keeps_only_its_pgrp_socket() {
+        let pid = std::process::id();
+        let mine = bind_control_sockets(&format!("test-ctrl-fork-mine-{pid}")).unwrap();
+        let sibling = bind_control_sockets(&format!("test-ctrl-fork-sibling-{pid}")).unwrap();
+        let keep = mine.pgrp.as_raw_fd();
+        let closed = [mine.control.as_raw_fd(), sibling.control.as_raw_fd(), sibling.pgrp.as_raw_fd()];
+
+        let child = fork_without_control_fds(Some(keep));
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            let is_open = |fd: RawFd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+            let ok = is_open(keep) && closed.iter().all(|&fd| !is_open(fd));
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "child status {status:#x}");
     }
 
     /// The pids come from the kernel's record of who called listen(), not

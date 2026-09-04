@@ -1422,14 +1422,13 @@ impl Sandbox {
             }
         }
 
-        let pid = unsafe { libc::fork() };
+        let pid = crate::control::fork_without_control_fds(None);
         if pid < 0 {
             unsafe { libc::close(ctrl_child_fd) };
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
-            crate::control::close_inherited_control_sockets(None);
             drop(ctrl_parent);
             unsafe { libc::setpgid(0, 0) };
             unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
@@ -1870,7 +1869,7 @@ impl Sandbox {
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
         // Bound before the fork so a name collision fails with no child to
-        // reap. Both fds are CLOEXEC; the child closes its copies itself.
+        // reap. The child sheds its copies as it forks.
         let sandbox_name = self.rt().name.clone();
         let mut control_sockets = match crate::control::bind_control_sockets(&sandbox_name) {
             Ok(s) => Some(s),
@@ -1894,14 +1893,13 @@ impl Sandbox {
         };
         let pgrp_socket = control_sockets.as_ref().map(|s| s.pgrp.as_raw_fd());
 
-        let pid = unsafe { libc::fork() };
+        let pid = crate::control::fork_without_control_fds(pgrp_socket);
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
-            crate::control::close_inherited_control_sockets(pgrp_socket);
             // killpg() needs the group to exist before anyone can connect,
             // and the dup2 loops below have fixed targets that can be this
             // socket's own fd number, so both come first.
