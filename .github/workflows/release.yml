@@ -210,8 +210,9 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [sdist, wheels, test]
-    # Only publish on a real tag push, not on a manual workflow_dispatch.
-    if: github.event_name == 'push'
+    # A manual dispatch republishes only PyPI, so a wheel build fixed after
+    # the tag can ship without a new version; PyPI rejects duplicate files.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
