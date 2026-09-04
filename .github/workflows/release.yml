@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: Publish the sdist and wheels to PyPI
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -210,9 +215,10 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [sdist, wheels, test]
-    # A manual dispatch republishes only PyPI, so a wheel build fixed after
-    # the tag can ship without a new version; PyPI rejects duplicate files.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # A dispatch is a dry run unless asked to republish PyPI, which is how a
+    # wheel build fixed after the tag ships without a new version. Nothing
+    # else republishes on dispatch, and PyPI rejects duplicate files.
+    if: github.event_name == 'push' || inputs.publish_pypi
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
